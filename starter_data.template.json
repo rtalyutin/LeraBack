@@ -1,0 +1,41 @@
+{
+  "status": "awaiting_salon_values",
+  "masters": [
+    {"id": 1, "name": null, "service_ids": [], "weekly_shifts": []},
+    {"id": 2, "name": null, "service_ids": [], "weekly_shifts": []},
+    {"id": 3, "name": null, "service_ids": [], "weekly_shifts": []},
+    {"id": 4, "name": null, "service_ids": [], "weekly_shifts": []},
+    {"id": 5, "name": null, "service_ids": [], "weekly_shifts": []}
+  ],
+  "services": [
+    {"id": 1, "name": null, "duration_minutes": null},
+    {"id": 2, "name": null, "duration_minutes": null},
+    {"id": 3, "name": null, "duration_minutes": null},
+    {"id": 4, "name": null, "duration_minutes": null},
+    {"id": 5, "name": null, "duration_minutes": null},
+    {"id": 6, "name": null, "duration_minutes": null},
+    {"id": 7, "name": null, "duration_minutes": null},
+    {"id": 8, "name": null, "duration_minutes": null},
+    {"id": 9, "name": null, "duration_minutes": null},
+    {"id": 10, "name": null, "duration_minutes": null}
+  ],
+  "rooms": [
+    {"id": 1, "name": null, "service_ids": [], "weekly_shifts": []},
+    {"id": 2, "name": null, "service_ids": [], "weekly_shifts": []}
+  ],
+  "policy": {
+    "timezone": null,
+    "booking_horizon_days": null,
+    "slot_step_minutes": null,
+    "min_notice_minutes": null,
+    "same_day_allowed": null,
+    "buffer_minutes": null,
+    "room_capacity": null,
+    "allow_parallel_client_bookings": null,
+    "cancel_cutoff_minutes": null,
+    "reschedule_cutoff_minutes": null,
+    "phone_verification_required": null,
+    "triple_restrictions": null,
+    "existing_booking_schedule_change_policy": null
+  }
+}

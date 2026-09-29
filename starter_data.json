@@ -1,0 +1,38 @@
+{
+  "status": "approved_synthetic_only",
+  "label": "ТЕСТОВЫЙ САЛОН — не реальные услуги и сотрудники",
+  "services": [
+    {"id": 1, "name": "Услуга 1", "duration_minutes": 30},
+    {"id": 2, "name": "Услуга 2", "duration_minutes": 60},
+    {"id": 3, "name": "Услуга 3", "duration_minutes": 30},
+    {"id": 4, "name": "Услуга 4", "duration_minutes": 60},
+    {"id": 5, "name": "Услуга 5", "duration_minutes": 30},
+    {"id": 6, "name": "Услуга 6", "duration_minutes": 60},
+    {"id": 7, "name": "Услуга 7", "duration_minutes": 30},
+    {"id": 8, "name": "Услуга 8", "duration_minutes": 60},
+    {"id": 9, "name": "Услуга 9", "duration_minutes": 30},
+    {"id": 10, "name": "Услуга 10", "duration_minutes": 60}
+  ],
+  "masters": [
+    {"id": 1, "name": "Мастер 1", "service_ids": [3, 4, 5], "avatar": "avatars/master-1.svg"},
+    {"id": 2, "name": "Мастер 2", "service_ids": [6, 7], "avatar": "avatars/master-2.svg"},
+    {"id": 3, "name": "Мастер 3", "service_ids": [1, 2, 8, 9, 10], "avatar": "avatars/master-3.svg"},
+    {"id": 4, "name": "Мастер 4", "service_ids": [3, 6, 8], "avatar": "avatars/master-4.svg"},
+    {"id": 5, "name": "Мастер 5", "service_ids": [4, 5, 7, 9, 10], "avatar": "avatars/master-5.svg"}
+  ],
+  "rooms": [
+    {"id": 1, "name": "Кабинет 1", "service_ids": [1, 2]},
+    {"id": 2, "name": "Кабинет 2", "service_ids": [3, 4, 5, 6, 7, 8, 9, 10]}
+  ],
+  "schedule": {"weekdays": [0, 1, 2, 3, 4, 5, 6], "start_minute": 540, "end_minute": 1080, "breaks": []},
+  "policy": {
+    "timezone": "Europe/Moscow", "booking_horizon_days": 30,
+    "slot_step_minutes": 30, "min_notice_minutes": 120,
+    "same_day_allowed": true, "buffer_minutes": 0, "room_capacity": 1,
+    "allow_parallel_client_bookings": false,
+    "cancel_cutoff_minutes": 60, "reschedule_cutoff_minutes": 60,
+    "phone_verification_required": false,
+    "existing_booking_schedule_change_policy": "cancel_affected_and_notify_vk"
+  },
+  "confirmation_placeholder": "ТЕСТОВЫЙ САЛОН. Адрес и цена будут указаны позднее."
+}
