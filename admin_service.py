@@ -91,6 +91,10 @@ def snapshot(path, policy, local_day: date):
                 "SELECT id,master_id,room_id,weekday,start_minute,end_minute FROM work_intervals "
                 "WHERE local_date IS NULL AND mode='open' ORDER BY weekday,id")],
         }
+        for kind in ("master", "room"):
+            links = list(db.execute(f"SELECT {kind}_id,service_id FROM {kind}_services ORDER BY service_id"))
+            for resource in catalog[f"{kind}s"]:
+                resource["service_ids"] = [link["service_id"] for link in links if link[f"{kind}_id"] == resource["id"]]
         bookings = [dict(r) for r in db.execute(
             "SELECT b.*,c.phone,c.vk_id,r.name AS room_name FROM bookings b "
             "LEFT JOIN clients c ON c.id=b.client_id JOIN rooms r ON r.id=b.room_id "
@@ -205,16 +209,107 @@ def create_block(path, resource_kind, resource_id, start, end, reason, actor, ac
             raise
 
 
+def _catalog_name(name):
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 160:
+        raise ValueError("Название должно содержать от 1 до 160 символов")
+    return name.strip()
+
+
+def _unique_name(db, table, name, object_id=None):
+    # Python casefold also works for Cyrillic on PostgreSQL clusters with locale C.
+    if any(row["id"] != object_id and row["name"].casefold() == name.casefold()
+           for row in db.execute(f"SELECT id,name FROM {table}")):
+        raise ValueError("Такое название уже существует")
+
+
+def create_service(path, name, duration_minutes, actor, now=None):
+    now = now or datetime.now(UTC)
+    name = _catalog_name(name)
+    if type(duration_minutes) is not int or not 1 <= duration_minutes <= 1440:
+        raise ValueError("Длительность услуги: от 1 до 1440 минут")
+    with closing(connect(path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            _unique_name(db, "services", name)
+            service_id = db.execute("INSERT INTO services(name,duration_minutes) VALUES (?,?)",
+                                    (name, duration_minutes)).lastrowid
+            _admin_audit(db, actor, "service_created", "service", service_id,
+                         {"name": name, "duration_minutes": duration_minutes}, now)
+            db.commit()
+            return {"id": service_id}
+        except Exception:
+            db.rollback()
+            raise
+
+
+def save_resource(path, resource_kind, resource_id, name, service_ids, active, actor,
+                  acknowledge=False, now=None):
+    """Create/edit a master or room, including its service eligibility."""
+    now = now or datetime.now(UTC)
+    name = _catalog_name(name)
+    if resource_kind not in {"master", "room"} or type(active) is not bool:
+        raise ValueError("Invalid resource or active flag")
+    if resource_id is not None and (type(resource_id) is not int or resource_id <= 0):
+        raise ValueError("Invalid resource ID")
+    if not isinstance(service_ids, list) or any(type(x) is not int or x <= 0 for x in service_ids):
+        raise ValueError("Услуги должны быть списком идентификаторов")
+    service_ids = sorted(set(service_ids))
+    table, column = f"{resource_kind}s", f"{resource_kind}_id"
+    with closing(connect(path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            _unique_name(db, table, name, resource_id)
+            for service_id in service_ids:
+                if not db.execute("SELECT 1 FROM services WHERE id=?", (service_id,)).fetchone():
+                    raise ValueError("Неизвестная услуга")
+            affected = []
+            if resource_id is None:
+                resource_id = db.execute(f"INSERT INTO {table}(name,active) VALUES (?,?)",
+                                         (name, int(active))).lastrowid
+                action = "resource_created"
+            else:
+                old = db.execute(f"SELECT * FROM {table} WHERE id=?", (resource_id,)).fetchone()
+                if old is None:
+                    raise LookupError("Ресурс не найден")
+                removed = {r[0] for r in db.execute(f"SELECT service_id FROM {resource_kind}_services WHERE {column}=?",
+                                                   (resource_id,))} - set(service_ids)
+                rows = db.execute(f"SELECT id,service_id,start_utc FROM bookings WHERE {column}=? "
+                                  "AND status='confirmed' AND end_utc>?", (resource_id, stamp(now))).fetchall()
+                affected_rows = [r for r in rows if (old["active"] and not active) or r["service_id"] in removed]
+                if any(parse(r["start_utc"]) <= now for r in affected_rows):
+                    raise AdminConflict("Нельзя изменить доступность ресурса во время приёма",
+                                        [r["id"] for r in affected_rows])
+                affected = [r["id"] for r in affected_rows]
+                if affected and not acknowledge:
+                    raise AdminConflict("Изменение затрагивает действующие записи", affected)
+                db.execute(f"UPDATE {table} SET name=?,active=? WHERE id=?", (name, int(active), resource_id))
+                action = "resource_updated"
+            db.execute(f"DELETE FROM {resource_kind}_services WHERE {column}=?", (resource_id,))
+            db.executemany(f"INSERT INTO {resource_kind}_services({column},service_id) VALUES (?,?)",
+                           [(resource_id, sid) for sid in service_ids])
+            manual = _cancel_affected(db, affected, actor, "resource_changed", now)
+            _admin_audit(db, actor, action, resource_kind, resource_id,
+                         {"name": name, "service_ids": service_ids, "active": active,
+                          "cancelled_booking_ids": affected}, now)
+            db.commit()
+            return {"id": resource_id, "cancelled_booking_ids": affected, "manual_contact_booking_ids": manual}
+        except Exception:
+            db.rollback()
+            raise
+
+
 def update_service(path, service_id, name, duration_minutes, active, actor, acknowledge=False, now=None):
     now = now or datetime.now(UTC)
-    if not name or not 30 <= duration_minutes <= 60:
-        raise ValueError("Service name and 30–60 minute duration required")
+    name = _catalog_name(name)
+    if type(duration_minutes) is not int or not 1 <= duration_minutes <= 1440 or type(active) is not bool:
+        raise ValueError("Длительность услуги: от 1 до 1440 минут; active должен быть boolean")
     with closing(connect(path)) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
             old = db.execute("SELECT * FROM services WHERE id=?", (service_id,)).fetchone()
             if old is None:
                 raise LookupError("Service not found")
+            _unique_name(db, "services", name, service_id)
             affected = [r[0] for r in db.execute(
                 "SELECT id FROM bookings WHERE service_id=? AND status='confirmed' AND start_utc>=?",
                 (service_id, stamp(now)),
@@ -238,17 +333,37 @@ def update_service(path, service_id, name, duration_minutes, active, actor, ackn
 
 
 def update_weekly_schedule(path, policy, resource_kind, resource_id, weekday,
-                           start_minute, end_minute, actor, acknowledge=False, now=None):
-    """Replace one resource's weekly opening hours; None/None marks the day closed."""
+                           start_minute, end_minute, actor, acknowledge=False, now=None, *, intervals=None):
+    """Replace a day's opening intervals; an empty list marks the day closed.
+
+    The legacy start_minute/end_minute request remains supported.
+    """
     now = now or datetime.now(UTC)
     zone = validate_policy(policy)
     if resource_kind not in {"master", "room"} or type(weekday) is not int or not 0 <= weekday <= 6:
         raise ValueError("Invalid resource kind or weekday")
-    if (start_minute is None) != (end_minute is None):
-        raise ValueError("Both times must be provided or both omitted")
-    if start_minute is not None and (type(start_minute) is not int or type(end_minute) is not int or
-                                     not 0 <= start_minute < end_minute <= 1440):
-        raise ValueError("Invalid work interval")
+    if intervals is None:
+        if (start_minute is None) != (end_minute is None):
+            raise ValueError("Both times must be provided or both omitted")
+        intervals = [] if start_minute is None else [{"start_minute": start_minute, "end_minute": end_minute}]
+    if not isinstance(intervals, list):
+        raise ValueError("Рабочие интервалы должны быть списком")
+    normalized = []
+    for interval in intervals:
+        if not isinstance(interval, dict):
+            raise ValueError("Invalid work interval")
+        a, b = interval.get("start_minute"), interval.get("end_minute")
+        if type(a) is not int or type(b) is not int or not 0 <= a < b <= 1440:
+            raise ValueError("Начало должно быть раньше конца в пределах одного дня")
+        normalized.append((a, b))
+    merged = []
+    for a, b in sorted(normalized):
+        if merged and a < merged[-1][1]:
+            raise ValueError("Рабочие интервалы не должны пересекаться")
+        if merged and a == merged[-1][1]:
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
     column = "master_id" if resource_kind == "master" else "room_id"
     table = "masters" if resource_kind == "master" else "rooms"
     with closing(connect(path)) as db:
@@ -258,24 +373,26 @@ def update_weekly_schedule(path, policy, resource_kind, resource_id, weekday,
                 raise LookupError("Resource not found")
             db.execute(f"DELETE FROM work_intervals WHERE {column}=? AND weekday=? AND local_date IS NULL AND mode='open'",
                        (resource_id, weekday))
-            if start_minute is not None:
+            for a, b in merged:
                 db.execute(
                     f"INSERT INTO work_intervals({column},weekday,mode,start_minute,end_minute) "
-                    "VALUES (?,?,'open',?,?)", (resource_id, weekday, start_minute, end_minute),
+                    "VALUES (?,?,'open',?,?)", (resource_id, weekday, a, b),
                 )
             upcoming = db.execute(
-                f"SELECT id,start_utc,end_utc FROM bookings WHERE {column}=? AND status='confirmed' AND start_utc>=?",
+                f"SELECT id,start_utc,end_utc FROM bookings WHERE {column}=? AND status='confirmed' AND end_utc>?",
                 (resource_id, stamp(now)),
             ).fetchall()
             affected = [r["id"] for r in upcoming
                         if parse(r["start_utc"]).astimezone(zone).weekday() == weekday
                         and not _working(db, resource_kind, resource_id, parse(r["start_utc"]),
                                          parse(r["end_utc"]), zone)]
+            if any(r["id"] in affected and parse(r["start_utc"]) <= now for r in upcoming):
+                raise AdminConflict("Нельзя изменить график во время приёма", affected)
             if affected and not acknowledge:
                 raise AdminConflict("Schedule change affects future confirmed bookings", affected)
             manual_contact = _cancel_affected(db, affected, actor, "weekly_schedule_changed", now)
             _admin_audit(db, actor, "weekly_schedule_updated", resource_kind, resource_id,
-                         {"weekday": weekday, "start_minute": start_minute, "end_minute": end_minute,
+                         {"weekday": weekday, "intervals": merged,
                           "cancelled_booking_ids": affected}, now)
             db.commit()
             return {"resource_kind": resource_kind, "resource_id": resource_id, "weekday": weekday,

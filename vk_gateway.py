@@ -83,6 +83,9 @@ class CallbackGateway:
             draft = {"id": uuid4().hex}
             self._save(vk_id, "service", draft)
             rows = self._rows("SELECT id,name FROM services WHERE active=1 ORDER BY name")
+            if not rows:
+                self._save(vk_id, "home", {})
+                return "Онлайн-запись пока настраивается. Попробуйте позже.", [button("В меню", "home")], None
             return "Выберите услугу", [button(r["name"], "service", r["id"], draft["id"]) for r in rows], None
         if command == "service" and state == "service":
             rows = self._rows("SELECT id,name FROM services WHERE id=? AND active=1", (int(value),))
@@ -94,6 +97,9 @@ class CallbackGateway:
                 "SELECT m.id,m.name FROM masters m JOIN master_services ms ON ms.master_id=m.id "
                 "WHERE ms.service_id=? AND m.active=1 ORDER BY m.name", (int(value),)
             )
+            if not masters:
+                self._save(vk_id, "home", {})
+                return "Для этой услуги пока нет доступных мастеров. Попробуйте позже.", [button("В меню", "home")], None
             choices = [dict(button(r["name"], "master", r["id"], draft["id"]),
                             avatar_master_id=r["id"]) for r in masters]
             return "Выберите мастера", choices, None

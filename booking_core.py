@@ -30,12 +30,15 @@ class BookingPermissionError(Exception):
 
 
 def migrate(db) -> None:
-    """Apply the initial PostgreSQL schema to an empty, disposable database."""
+    """Apply the schema and repeatable, non-destructive constructor migration."""
     try:
         db.execute("BEGIN IMMEDIATE")
         db.execute(SCHEMA.read_text(encoding="utf-8"))
+        db.execute("ALTER TABLE services DROP CONSTRAINT IF EXISTS services_duration_minutes_check")
+        db.execute("ALTER TABLE services ADD CONSTRAINT services_duration_minutes_check CHECK (duration_minutes BETWEEN 1 AND 1440)")
         db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES (1, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) ON CONFLICT DO NOTHING")
         db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES (2, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) ON CONFLICT DO NOTHING")
+        db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES (3, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) ON CONFLICT DO NOTHING")
         db.commit()
     except Exception:
         db.rollback()

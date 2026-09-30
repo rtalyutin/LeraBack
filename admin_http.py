@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 from collections import defaultdict, deque
 from contextlib import closing
@@ -19,8 +20,8 @@ from admin_auth import (
     logout, require_admin, verify_csrf,
 )
 from admin_service import (
-    AdminConflict, cancel_admin_booking, create_block, create_manual_booking, snapshot,
-    update_service, update_weekly_schedule,
+    AdminConflict, cancel_admin_booking, create_block, create_manual_booking, create_service,
+    save_resource, snapshot, update_service, update_weekly_schedule,
 )
 from booking_core import BookingConflict, connect
 from ops import database_health
@@ -153,6 +154,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, snapshot(self.server.db_path, self.server.policy, day))
 
             body = self._body() if method == "POST" else {}
+            if not isinstance(body, dict):
+                raise ValueError("JSON object required")
+            if "acknowledge" in body and type(body["acknowledge"]) is not bool:
+                raise ValueError("acknowledge must be boolean")
             now = self.server.clock()
             actor = identity.actor
             if method == "POST" and path.path == "/api/bookings":
@@ -170,12 +175,15 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self._json(201, result)
             if method == "POST" and path.path == "/api/weekly-schedule":
+                if "intervals" in body and not isinstance(body["intervals"], list):
+                    raise ValueError("intervals must be a list")
                 start = body.get("start_minute")
                 end = body.get("end_minute")
                 result = update_weekly_schedule(
                     self.server.db_path, self.server.policy, body["resource_kind"], int(body["resource_id"]),
                     int(body["weekday"]), None if start is None else int(start),
                     None if end is None else int(end), actor, bool(body.get("acknowledge")), now,
+                    intervals=body.get("intervals"),
                 )
                 return self._json(200, result)
             if method == "POST" and path.path.startswith("/api/bookings/") and path.path.endswith("/cancel"):
@@ -184,11 +192,23 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.db_path, booking_id, body.get("action_key") or secrets.token_urlsafe(16), actor, now
                 )
                 return self._json(200, result)
-            if method == "POST" and path.path.startswith("/api/services/"):
+            if method == "POST" and path.path == "/api/services":
+                return self._json(201, create_service(self.server.db_path, body["name"],
+                                                      body["duration_minutes"], actor, now))
+            resource = re.fullmatch(r"/api/(masters|rooms)(?:/([1-9][0-9]*))?", path.path)
+            if method == "POST" and resource:
+                resource_id = int(resource[2]) if resource[2] else None
+                result = save_resource(
+                    self.server.db_path, "master" if resource[1] == "masters" else "room", resource_id,
+                    body["name"], body["service_ids"], body["active"], actor,
+                    bool(body.get("acknowledge")), now,
+                )
+                return self._json(201 if resource_id is None else 200, result)
+            if method == "POST" and re.fullmatch(r"/api/services/[1-9][0-9]*", path.path):
                 service_id = int(path.path.split("/")[3])
                 result = update_service(
-                    self.server.db_path, service_id, body["name"], int(body["duration_minutes"]),
-                    bool(body["active"]), actor, bool(body.get("acknowledge")), now,
+                    self.server.db_path, service_id, body["name"], body["duration_minutes"],
+                    body["active"], actor, bool(body.get("acknowledge")), now,
                 )
                 return self._json(200, result)
             return self._json(404, {"error": "not_found"})
