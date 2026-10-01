@@ -103,21 +103,27 @@ class StartupAuthUnits(unittest.TestCase):
         # Create the auth-unit schema first; PG migration has its own integration suite.
         with closing(auth_unit_connect(self.path)) as db:
             db.executescript(AUTH_SCHEMA)
-        contenders = [("first_admin", "First-synthetic-password"),
-                      ("second_admin", "Second-synthetic-password")]
+        contenders = [("salon_admin", "First-synthetic-password"),
+                      ("salon_admin", "Second-synthetic-password")]
         barrier = threading.Barrier(2)
         def provision(values):
-            barrier.wait()
+            barrier.wait(timeout=30)
             return admin_auth.create_or_update_admin(self.path, *values, initial_only=True)
         with ThreadPoolExecutor(max_workers=2) as pool:
             ids = list(pool.map(provision, contenders))
         self.assertEqual(ids[0], ids[1])
-        user = self.read_user()
-        winner = next(values for values in contenders if values[0] == user["username"])
-        admin_auth.login(self.path, *winner)
+        successful_logins = []
+        for values in contenders:
+            try:
+                successful_logins.append(admin_auth.login(self.path, *values))
+            except admin_auth.AuthenticationError:
+                pass
+        self.assertEqual(len(successful_logins), 1)
+        self.assertEqual(successful_logins[0][1].user_id, ids[0])
         with closing(auth_unit_connect(self.path)) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM admin_users").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT count(*) FROM admin_audit_log WHERE action='admin_created'").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM admin_audit_log WHERE action='password_changed'").fetchone()[0], 0)
 
 
 class StartupHttpUnits(unittest.TestCase):
@@ -173,20 +179,32 @@ class StartupPostgresIntegration(unittest.TestCase):
                 startup.prepare_database(URL, "salon_admin", password)
             with closing(connect(URL)) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM admin_users").fetchone()[0], 0)
-        contenders = [("first_admin", "First-synthetic-password"),
-                      ("second_admin", "Second-synthetic-password")]
+        contenders = [("salon_admin", "First-synthetic-password"),
+                      ("salon_admin", "Second-synthetic-password")]
         barrier = threading.Barrier(2)
-        def launch(values):
-            barrier.wait()
-            return startup.prepare_database(URL, *values)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            ids = list(pool.map(launch, contenders))
+        real_provision = admin_auth.create_or_update_admin
+        def synchronized_provision(*args, **kwargs):
+            # Both launches have read an empty table before either may provision.
+            # Only scheduling is controlled; the PG transaction and auth stay real.
+            self.assertTrue(kwargs.get("initial_only"))
+            barrier.wait(timeout=30)
+            return real_provision(*args, **kwargs)
+        with patch.object(startup, "create_or_update_admin", synchronized_provision):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                ids = list(pool.map(lambda values: startup.prepare_database(URL, *values), contenders))
         self.assertEqual(ids[0], ids[1])
         first = ids[0]
         with closing(connect(URL)) as db:
             before = dict(db.execute("SELECT * FROM admin_users").fetchone())
-        winner = next(values for values in contenders if values[0] == before["username"])
-        token, identity = admin_auth.login(URL, *winner)
+        successful_logins = []
+        for values in contenders:
+            try:
+                successful_logins.append(admin_auth.login(URL, *values))
+            except admin_auth.AuthenticationError:
+                pass
+        self.assertEqual(len(successful_logins), 1)
+        token, identity = successful_logins[0]
+        self.assertEqual(identity.user_id, first)
         service = create_service(URL, "Synthetic startup service", 45, "admin:test")
         state = snapshot(URL, POLICY, date.today())
         self.assertEqual(startup.prepare_database(URL, "ignored_admin", "short"), first)
@@ -199,6 +217,7 @@ class StartupPostgresIntegration(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM masters").fetchone()[0], 0)
             self.assertEqual(dict(db.execute("SELECT * FROM admin_users").fetchone()), before)
             self.assertEqual(db.execute("SELECT count(*) FROM admin_audit_log WHERE action='admin_created'").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM admin_audit_log WHERE action='password_changed'").fetchone()[0], 0)
             db.execute("UPDATE admin_users SET active=0")
         with self.assertRaises(RuntimeError):
             startup.prepare_database(URL, "replacement", PASSWORD)
