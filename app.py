@@ -8,6 +8,8 @@ import threading
 from datetime import datetime, timezone
 
 from admin_http import Handler as AdminHandler, server
+from booking_core import validate_policy
+from startup import prepare_database
 from vk_gateway import CallbackGateway, deliver_pending
 from vk_sender import VKSender
 
@@ -52,15 +54,25 @@ def outgoing_loop(database_url, sender, stop):
 def main():
     database_url = os.environ["DATABASE_URL"]
     policy = json.loads(os.environ["SALON_POLICY_JSON"])
+    validate_policy(policy)
+    csrf_secret = os.environ["SALON_CSRF_SECRET"]
+    if len(csrf_secret.encode()) < 32 or csrf_secret == "REPLACE_WITH_32_OR_MORE_RANDOM_BYTES":
+        raise RuntimeError("SALON_CSRF_SECRET must contain at least 32 bytes")
+    port = int(os.environ.get("PORT", "8080"))
+    if not 1 <= port <= 65535:
+        raise RuntimeError("PORT must be between 1 and 65535")
     vk_keys = ("VK_GROUP_ID", "VK_CALLBACK_SECRET", "VK_CONFIRMATION_CODE")
     if any(os.environ.get(key) for key in vk_keys) and not all(os.environ.get(key) for key in vk_keys):
         raise RuntimeError("Incomplete VK callback configuration")
+    prepare_database(database_url, os.environ.get("SALON_ADMIN_USERNAME", "salon_admin"),
+                     os.environ.pop("SALON_ADMIN_PASSWORD", None))
+    print("Database initialized; administrator ready", flush=True)
     gateway = (CallbackGateway(database_url, policy, int(os.environ["VK_GROUP_ID"]),
                                os.environ["VK_CALLBACK_SECRET"], os.environ["VK_CONFIRMATION_CODE"])
                if all(os.environ.get(key) for key in vk_keys) else None)
     stop = threading.Event()
-    with server(database_url, policy, os.environ["SALON_CSRF_SECRET"], host="0.0.0.0",
-                port=int(os.environ.get("PORT", "8080")), handler_class=Handler) as httpd:
+    with server(database_url, policy, csrf_secret, host="0.0.0.0",
+                port=port, handler_class=Handler) as httpd:
         httpd.gateway = gateway
         if gateway and os.environ.get("VK_COMMUNITY_TOKEN"):
             sender = VKSender(os.environ["VK_COMMUNITY_TOKEN"], os.environ.get("VK_API_VERSION", "5.199"),

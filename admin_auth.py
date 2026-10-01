@@ -49,7 +49,7 @@ def _password_hash(password: str, salt: bytes, iterations: int = PBKDF2_ITERATIO
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=32)
 
 
-def create_or_update_admin(path, username: str, password: str, now=None) -> int:
+def create_or_update_admin(path, username: str, password: str, now=None, *, initial_only=False) -> int:
     """Provision an administrator locally; the password is never persisted verbatim."""
     now = now or datetime.now(UTC)
     username = username.strip()
@@ -60,6 +60,14 @@ def create_or_update_admin(path, username: str, password: str, now=None) -> int:
     with closing(connect(path)) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
+            if initial_only:
+                users = list(db.execute("SELECT id,active FROM admin_users"))
+                if users:
+                    active = [user for user in users if user["active"]]
+                    if len(active) != 1:
+                        raise ValueError("Initial setup cannot reactivate or replace administrator accounts")
+                    db.commit()
+                    return active[0]["id"]
             existing = db.execute("SELECT id FROM admin_users WHERE lower(username)=lower(?)", (username,)).fetchone()
             if existing:
                 user_id = existing["id"]

@@ -126,6 +126,8 @@ class Handler(BaseHTTPRequestHandler):
     def _route(self, method):
         path = urlparse(self.path)
         try:
+            if method == "GET" and path.path == "/livez":
+                return self._json(200, {"status": "ok"})
             if method == "GET" and path.path == "/healthz":
                 health = database_health(self.server.db_path)
                 return self._json(200 if health["status"] == "ok" else 503,
@@ -229,7 +231,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(500, {"error": "internal_error"})
 
     def do_GET(self):
-        if self.path == "/healthz" or self.path.startswith("/api/"):
+        if self.path in {"/healthz", "/livez"} or self.path.startswith("/api/"):
             return self._route("GET")
         return self._json(404, {"error": "not_found"})
 
