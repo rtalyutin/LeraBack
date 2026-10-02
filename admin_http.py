@@ -283,11 +283,11 @@ class Handler(BaseHTTPRequestHandler):
         return self._route("POST")
 
 
-def server(db_path, policy, csrf_secret, host="127.0.0.1", port=8765, *, secure_cookie=True,
+def server(db_path, policy, csrf_secret=None, host="127.0.0.1", port=8765, *, secure_cookie=True,
            session_idle_minutes=30, session_absolute_hours=12, clock=None, handler_class=Handler):
     if isinstance(csrf_secret, str):
         csrf_secret = csrf_secret.encode()
-    if len(csrf_secret or b"") < 32:
+    if csrf_secret is not None and len(csrf_secret) < 32:
         raise RuntimeError("SALON_CSRF_SECRET must contain at least 32 bytes")
     if host not in {"127.0.0.1", "localhost", "0.0.0.0"}:
         raise RuntimeError("Unsupported bind address")
@@ -312,10 +312,11 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
-    policy = json.loads(os.environ["SALON_POLICY_JSON"])
+    from runtime_config import initial_policy, optional_csrf_secret
+    policy = initial_policy()
     secure_cookie = os.environ.get("SALON_COOKIE_SECURE", "1") != "0"
     with server(
-        os.environ["DATABASE_URL"], policy, os.environ.get("SALON_CSRF_SECRET", ""), args.host, args.port,
+        os.environ["DATABASE_URL"], policy, optional_csrf_secret(), args.host, args.port,
         secure_cookie=secure_cookie,
         session_idle_minutes=int(os.environ.get("SALON_SESSION_IDLE_MINUTES", "30")),
         session_absolute_hours=int(os.environ.get("SALON_SESSION_ABSOLUTE_HOURS", "12")),

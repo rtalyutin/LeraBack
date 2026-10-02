@@ -1,18 +1,33 @@
 # Проверка общей базы, нескольких салонов и отдельной SQL-схемы
 
-Проверенная версия: миграция 4, выбор `DATABASE_SCHEMA`, обновление функций существующей версии 4 и исправление scoped UPSERT. Рабочая БД tg-mcp и Timeweb не изменялись.
+Текущая правка сокращает обязательные переменные запуска до DATABASE_URL и bootstrap SALON_ADMIN_PASSWORD. Добавлены runtime defaults и CSRF от случайной сессии без обязательного глобального ключа. SQL/адаптер/prepare_database не менялись. Рабочая БД tg-mcp и Timeweb не изменялись.
 
 | Проверка | Фактический результат | Граница |
 | --- | --- | --- |
-| Python compilation | PASS | Синтаксис Python |
-| Backend unittest | 18 PASS, 26 SKIP (44 всего), без ошибок | PostgreSQL integration tests пропущены без тестовых DATABASE_URL |
+| Python syntax/import | PASS | AST parse Python и импорты в unittest |
+| Backend unittest | 22 PASS, 26 SKIP (48 всего), без ошибок | PostgreSQL integration tests пропущены без тестовых DATABASE_URL |
+| Independent minimal-config HTTP/auth | 53 исполненных наблюдения: HTTP 30, отдельные процессы 9, config 14 | Реальные loopback HTTP/auth функции с SQLite connect seam; tenant/domain stubs, startup boundaries mocked |
 | Front syntax и contract tests | Предыдущие 20 PASS | Проверенный app.js не менялся; stub DOM, не браузер и не live API |
-| Independent namespace/migration/EAV/RLS/UPSERT SQL | 115 успешных наблюдений в 7 сценариях | Реальный SQL на PostgreSQL WASM, одна физическая сессия на движок |
+| Independent namespace/migration/EAV/RLS/UPSERT SQL | Предыдущий прогон: 115 успешных наблюдений в 7 сценариях на commit 38296ae | SQL/адаптер/миграции не изменились; текущий HTTP/config runtime отличается |
 | Native PostgreSQL 16 integration | BLOCKED в этой среде | Подготовлен compose.test.yml с шестью одноразовыми БД |
-| Browser render и full authenticated multi-salon API | Не проверены | Отдельные HTTP/API/auth/attach и конкурентные запросы не исполнялись |
+| Browser render и full authenticated multi-salon API | Не проверены | Полный tenant API, браузер и конкурентные запросы не исполнялись |
 | Docker build / Timeweb / production migration / TLS / VK delivery | Не выполнены | Публикация кода не подтверждает выпуск |
 
-## Выполненные проверки SQL
+## Текущая авторская проверка конфигурации
+
+Команда: `PYTHONPATH=/tmp/lera-test-deps python -B -m unittest discover -s tests`, Python 3.12. Четыре новых теста проверяют минимальные входы app.main для bootstrap/повтора (runtime boundaries mocked), значения по умолчанию и невалидную policy, CSRF разных сессий/поддельный токен и стабильность вычисления в новом Python-процессе, прежний explicit-secret режим. Существующие SQLite auth units подтверждают сохранение пароля/сессии и запрет автоматического восстановления отключённого аккаунта; это не PostgreSQL acceptance.
+
+## Независимая проверка минимальных переменных
+
+53 исполненных наблюдения подтверждают работу без глобального CSRF-ключа, отдельные токены для разных сессий одного/разных аккаунтов, отсутствие cookie в JSON, отказ с отсутствующим/чужим/поддельным CSRF или cookie, logout и отзыв сессий при смене пароля, прежний explicit-secret режим и получение нового токена после его удаления. Сессия и точное значение CSRF сохранились между двумя отдельными Python-процессами HTTP сервера; прежний токен позволил выйти, а отозванный cookie затем получил 401.
+
+Это фактические admin_http.Handler/server и admin_auth функции на loopback HTTP с явной заменой connect на синтетическую SQLite auth fixture. Доступ к салонам/политике и защищённая domain mutation заменены ограниченными stubs. Конфигурация app.main исполнена с mocked prepare_database/server: это проверяет требуемые входы и валидацию, а не подключение PostgreSQL или первый реальный деплой. Docker ENV schema lera и public override тестового compose проверены только статически; это ещё два отдельных source observations, не исполнение Docker.
+
+Формы/text/plain без допустимого JSON и CSRF отказали, cross-origin без/с чужим токеном отказал, OPTIONS не выдал CORS-разрешения. Диагностический запрос с уже известными валидными cookie/CSRF и чужим Origin был принят: сервер не проверяет Origin самостоятельно. Это сохранённая граница текущего API; фактический браузер/preflight и Nginx здесь не запускались, browser exploit не заявляется. Non-ASCII токен получил 422 без mutation; обычные ошибочные CSRF — 403.
+
+Во всех трёх независимых сценариях before/after/current совпали с freeze 25 файлов, manifest SHA-256 `7b78469aeb2c62683d4e245628734528885476baf7f0d1eca6b24139d8f10151`. compose.test.yml проверен отдельно: `448cc2f037a6170fbf43ba622e9cee2eca8a4cc59b4377648909a43834e64616`. Полный PostgreSQL tenant API, concurrency, браузер, TLS, Docker, Timeweb и backup/restore остаются непроверенными.
+
+## Ранее выполненные проверки SQL
 
 Движок: PostgreSQL 18.3 WASM (PGlite 0.5.8), pglite-socket 0.2.11, psycopg 3.3.6 ClientCursor. Использовались фактические адаптер, миграции, startup, ops и seed приложения.
 
@@ -39,7 +54,7 @@
 
 PGlite использует одну физическую серверную сессию на движок; логические переподключения её сохраняют. Поэтому проверки не подтверждают независимость подключений и TEMP/context, native login, параллельные RLS/booking гонки, пул соединений, TLS, crash durability или восстановление резервной копии. Поведение полного HTTP/auth/attach API не подтверждено этими SQL-наблюдениями.
 
-Все семь финальных сценариев прошли с официальным параметром max-connections=16; вызовы приложения оставались последовательными. Во всех сценариях совпали SHA-256 всех 22 runtime-файлов до и после прогона. Итоговый manifest SHA-256: `8c9aa5418a4bc14d1c4b1e719e1ea55a6808edc1b2088249ea00911410e298d6`.
+Все семь сценариев предыдущей namespace-версии прошли с официальным параметром max-connections=16; вызовы приложения оставались последовательными. В них совпали SHA-256 всех 22 runtime-файлов до и после прогона. Итоговый прежний manifest SHA-256: `8c9aa5418a4bc14d1c4b1e719e1ea55a6808edc1b2088249ea00911410e298d6`. Теперь изменены app.py/admin_http.py/admin_auth.py и добавлен runtime_config.py; прежние SHA и SQL-наблюдения не подтверждают новое HTTP/config поведение.
 
 ## Следующий воспроизводимый этап
 
@@ -54,7 +69,7 @@ docker compose -f compose.test.yml down
 
 Перед рабочим применением нужны результаты обычного PostgreSQL, проверки подключения к целевой БД и резервного копирования/восстановления. Старый backend несовместим со схемой 4; откат кода не откатывает БД. Резервная копия общей базы затрагивает tg-mcp и Lera.
 
-## SHA-256 проверенных runtime-файлов
+## SHA-256 предыдущей namespace-версии (исторический прогон)
 
 ```text
 8481e43a6d3711abcdceec45b7a89d5e75deb88e7a907f71059f5cd31f8e5487  admin_auth.py

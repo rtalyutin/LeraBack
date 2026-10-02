@@ -167,13 +167,21 @@ def require_admin(identity: AdminIdentity) -> None:
         raise AuthorizationError("Administrator role required")
 
 
-def csrf_token(session_token: str, secret: bytes) -> str:
+def csrf_token(session_token: str, secret: bytes | None = None) -> str:
+    if secret is None:
+        # login() generates a fresh 256-bit secret for every session. Derive a
+        # separate, non-reversible CSRF value instead of exposing the cookie.
+        # No process-local key: the same authenticated session survives restart.
+        key = session_token.encode()
+        if len(key) < 32:
+            raise ValueError("A cryptographically random session token is required")
+        return hmac.new(key, b"lera/admin/csrf/v1", hashlib.sha256).hexdigest()
     if len(secret) < 32:
         raise ValueError("CSRF secret must contain at least 32 bytes")
     return hmac.new(secret, session_token.encode(), hashlib.sha256).hexdigest()
 
 
-def verify_csrf(identity: AdminIdentity, secret: bytes, supplied: str) -> bool:
+def verify_csrf(identity: AdminIdentity, secret: bytes | None, supplied: str) -> bool:
     return bool(supplied) and hmac.compare_digest(csrf_token(identity.session_token, secret), supplied)
 
 

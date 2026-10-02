@@ -14,7 +14,7 @@ from contextlib import closing
 from datetime import date
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
@@ -22,6 +22,7 @@ import admin_auth
 import admin_http
 import app
 import startup
+import runtime_config
 from admin_service import create_service, snapshot
 from booking_core import connect
 from pg_store import SalonScope
@@ -137,6 +138,38 @@ class StartupAuthUnits(unittest.TestCase):
 
 
 class StartupHttpUnits(unittest.TestCase):
+    def test_app_accepts_minimal_first_launch_and_restart_configuration(self):
+        for password in (PASSWORD, None):
+            env = {"DATABASE_URL": "postgresql://synthetic/unused_test"}
+            if password is not None:
+                env["SALON_ADMIN_PASSWORD"] = password
+            httpd = MagicMock()
+            httpd.__enter__.return_value = httpd
+            with patch.dict(os.environ, env, clear=True), \
+                    patch.object(app, "prepare_database") as prepare, \
+                    patch.object(app, "server", return_value=httpd) as create_server, \
+                    patch("builtins.print"):
+                app.main()
+                prepare.assert_called_once_with(env["DATABASE_URL"], "salon_admin", password)
+                self.assertNotIn("SALON_ADMIN_PASSWORD", os.environ)
+                args = create_server.call_args
+                self.assertEqual(args.args, (env["DATABASE_URL"], POLICY, None))
+                self.assertEqual(args.kwargs["port"], 8080)
+                httpd.serve_forever.assert_called_once()
+
+    def test_optional_policy_override_is_validated_and_defaults_are_independent(self):
+        with patch.dict(os.environ, {}, clear=True):
+            first = runtime_config.initial_policy()
+            first["slot_step_minutes"] = 10
+            self.assertEqual(runtime_config.initial_policy()["slot_step_minutes"], 30)
+        changed = {**POLICY, "booking_horizon_days": 15}
+        with patch.dict(os.environ, {"SALON_POLICY_JSON": json.dumps(changed)}, clear=True):
+            self.assertEqual(runtime_config.initial_policy()["booking_horizon_days"], 15)
+        for raw in ("", "not-json", json.dumps({**POLICY, "slot_step_minutes": 0})):
+            with patch.dict(os.environ, {"SALON_POLICY_JSON": raw}, clear=True):
+                with self.assertRaises(ValueError):
+                    runtime_config.initial_policy()
+
     def test_liveness_stays_available_when_database_is_unavailable(self):
         # Real HTTP and a real refused psycopg connection, not a mocked health response.
         with ThreadingHTTPServer(("127.0.0.1", 0), admin_http.Handler) as httpd:
@@ -168,6 +201,41 @@ class StartupHttpUnits(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     app.main()
                 prepare.assert_not_called()
+
+
+class SessionCsrfUnits(unittest.TestCase):
+    def test_default_token_is_bound_to_a_secret_session_and_is_restart_stable(self):
+        import secrets
+        import subprocess
+        import sys
+        session = secrets.token_urlsafe(32)
+        other_session = secrets.token_urlsafe(32)
+        identity = admin_auth.AdminIdentity(1, "salon_admin", "admin", 1, session)
+        token = admin_auth.csrf_token(session)
+        self.assertEqual(len(token), 64)
+        self.assertNotEqual(token, session)
+        self.assertTrue(admin_auth.verify_csrf(identity, None, token))
+        for wrong in ("", "0" * 64, session, admin_auth.csrf_token(other_session)):
+            self.assertFalse(admin_auth.verify_csrf(identity, None, wrong))
+        fresh_process = subprocess.run(
+            [sys.executable, "-B", "-c", "import sys; from admin_auth import csrf_token; "
+             "print(csrf_token(sys.stdin.read()))"], input=session, text=True,
+            capture_output=True, check=True,
+        )
+        self.assertEqual(fresh_process.stdout.strip(), token)
+
+    def test_legacy_key_is_supported_and_invalid_keys_are_rejected(self):
+        import hashlib
+        import hmac
+        session = "a" * 43
+        secret = b"legacy-synthetic-key" * 2
+        expected = hmac.new(secret, session.encode(), hashlib.sha256).hexdigest()
+        self.assertEqual(admin_auth.csrf_token(session, secret), expected)
+        for secret in (b"", b"short"):
+            with self.assertRaises(ValueError):
+                admin_auth.csrf_token(session, secret)
+        with self.assertRaises(ValueError):
+            admin_auth.csrf_token("short")
 
 
 URL = os.environ.get("STARTUP_TEST_DATABASE_URL", "")

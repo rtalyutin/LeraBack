@@ -22,6 +22,8 @@ services:
       - ./:/app:ro
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
+      # Legacy/native fixtures start in public; namespace tests select lera explicitly.
+      DATABASE_SCHEMA: public
       TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/booking_test
       CONSTRUCTOR_TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/constructor_test
       STARTUP_TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/startup_test
