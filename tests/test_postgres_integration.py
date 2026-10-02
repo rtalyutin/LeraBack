@@ -26,7 +26,7 @@ class PostgresIntegration(unittest.TestCase):
         if not urlsplit(TEST_URL).path.removeprefix("/").endswith("_test"):
             raise ValueError("Use a disposable database whose name ends in _test")
         with connect(TEST_URL) as db:
-            if db.execute("SELECT to_regclass('public.bookings')").fetchone()[0] is not None:
+            if db.execute("SELECT to_regclass('__APP_SCHEMA__.bookings')").fetchone()[0] is not None:
                 raise ValueError("TEST_DATABASE_URL must point to a fresh empty database")
         seed(TEST_URL)
 

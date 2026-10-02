@@ -180,7 +180,7 @@ class StartupPostgresIntegration(unittest.TestCase):
         if not urlsplit(URL).path.endswith("_test"):
             raise ValueError("Use a fresh disposable *_test database")
         with closing(connect(URL)) as db:
-            if db.execute("SELECT to_regclass('public.admin_users')").fetchone()[0] is not None:
+            if db.execute("SELECT to_regclass('__APP_SCHEMA__.admin_users')").fetchone()[0] is not None:
                 raise ValueError("Startup test database must be fresh")
 
     def test_first_launch_restart_concurrency_and_disabled_account(self):
@@ -224,7 +224,7 @@ class StartupPostgresIntegration(unittest.TestCase):
         self.assertEqual(state["services"][0]["id"], service["id"])
         with closing(connect(URL)) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM admin_users").fetchone()[0], 1)
-            self.assertEqual(db.execute("SELECT count(*) FROM public.masters WHERE salon_id=1").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM __APP_SCHEMA__.masters WHERE salon_id=1").fetchone()[0], 0)
             self.assertEqual(dict(db.execute("SELECT * FROM admin_users").fetchone()), before)
             self.assertEqual(db.execute("SELECT count(*) FROM account_audit_log WHERE action='admin_created'").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT count(*) FROM account_audit_log WHERE action='password_changed'").fetchone()[0], 0)

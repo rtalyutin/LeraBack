@@ -21,8 +21,8 @@ def database_health(url):
     try:
         with closing(connect(url)) as db:
             db.execute("SELECT 1").fetchone()
-            version = db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0]
-            if version is None or version < 4:
+            version = db.execute("SELECT max(version) FROM __APP_SCHEMA__.schema_migrations").fetchone()[0]
+            if version != 4:
                 return {"status": "error"}
         return {"status": "ok", "schema_version": version}
     except Exception:
@@ -32,12 +32,14 @@ def database_health(url):
 def verify_database(url):
     with closing(connect(url)) as db:
         tables = {r[0] for r in db.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema=current_schema()"
+            "SELECT table_name FROM information_schema.tables WHERE table_schema=?", (db.schema_name,)
         )}
         missing = REQUIRED_TABLES - tables
         if missing:
             raise ValueError(f"Missing required tables: {', '.join(sorted(missing))}")
-        version = db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0]
+        version = db.execute("SELECT max(version) FROM __APP_SCHEMA__.schema_migrations").fetchone()[0]
+        if version != 4:
+            raise ValueError("Database schema version 4 is required by this backend")
     return {"status": "ok", "schema_version": version}
 
 

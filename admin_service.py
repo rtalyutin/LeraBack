@@ -94,7 +94,7 @@ def snapshot(path, policy, local_day: date):
         }
         for table in ("services", "masters", "rooms"):
             for item in catalog[table]:
-                extra = db.execute(f"SELECT entity_id FROM public.{table} WHERE salon_id=public.current_salon_id() AND id=?", (item["id"],)).fetchone()
+                extra = db.execute(f"SELECT entity_id FROM __APP_SCHEMA__.{table} WHERE salon_id=__APP_SCHEMA__.current_salon_id() AND id=?", (item["id"],)).fetchone()
                 item["entity_id"] = extra["entity_id"]
         for kind in ("master", "room"):
             links = list(db.execute(f"SELECT {kind}_id,service_id FROM {kind}_services ORDER BY service_id"))

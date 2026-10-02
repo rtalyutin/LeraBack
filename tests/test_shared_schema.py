@@ -17,6 +17,7 @@ from threading import Barrier
 from urllib.parse import urlsplit
 from uuid import uuid4
 from unittest.mock import patch
+from database_namespace import relation_name, render_sql, schema_name
 
 from constructor_store import (ConstructorError, _code, _id, _typed_value,
     archive_entity, constructor_snapshot, create_type, delete_parameter,
@@ -74,7 +75,9 @@ class _Database:
     """Use the real PG driver without relying on the compatibility view adapter."""
     def __init__(self, url, salon_id=None):
         import psycopg
+        self.schema_name = schema_name()
         self.connection = psycopg.connect(url, autocommit=True, row_factory=_factory)
+        self.execute("SET search_path TO __APP_SCHEMA__")
         if salon_id is not None:
             self.execute("SELECT set_config('app.salon_id',?,false)", (str(salon_id),))
 
@@ -82,7 +85,7 @@ class _Database:
         if sql == "BEGIN IMMEDIATE":
             self.connection.execute("BEGIN")
             return self.connection.execute("SELECT pg_advisory_xact_lock(706547229101)")
-        return self.connection.execute(sql.replace("?", "%s"), params or None)
+        return self.connection.execute(render_sql(sql, self.schema_name).replace("?", "%s"), params or None)
 
     def commit(self):
         self.connection.commit()
@@ -105,26 +108,26 @@ class SharedPostgres(unittest.TestCase):
             role = db.execute("SELECT rolsuper,rolbypassrls FROM pg_roles WHERE rolname=current_user").fetchone()
             if role["rolsuper"] or role["rolbypassrls"]:
                 raise ValueError("RLS tests require NOSUPERUSER NOBYPASSRLS; superuser results are not evidence")
-            if db.execute("SELECT to_regclass('public.bookings')").fetchone()[0] is not None:
+            if db.execute("SELECT to_regclass('__APP_SCHEMA__.bookings')").fetchone()[0] is not None:
                 raise ValueError("SHARED_SCHEMA_TEST_DATABASE_URL must be fresh; no data is erased")
             db.execute((ROOT / "schema_postgres.sql").read_text())
-            db.execute("INSERT INTO public.schema_migrations VALUES(1,'legacy'),(2,'legacy'),(3,'legacy')")
+            db.execute("INSERT INTO __APP_SCHEMA__.schema_migrations VALUES(1,'legacy'),(2,'legacy'),(3,'legacy')")
             # Realistic legacy IDs, confirmed booking, history and live session.
-            db.execute("INSERT INTO public.services(id,name,duration_minutes) VALUES(77,'Legacy service',30)")
-            db.execute("INSERT INTO public.masters(id,name) VALUES(88,'Legacy master')")
-            db.execute("INSERT INTO public.rooms(id,name) VALUES(99,'Legacy room')")
-            db.execute("INSERT INTO public.clients(id,vk_id,phone,phone_provided_at) VALUES(66,12345,'+79990000066','2025-01-01T00:00:00Z')")
-            db.execute("""INSERT INTO public.bookings(id,client_id,service_id,master_id,room_id,start_utc,end_utc,
+            db.execute("INSERT INTO __APP_SCHEMA__.services(id,name,duration_minutes) VALUES(77,'Legacy service',30)")
+            db.execute("INSERT INTO __APP_SCHEMA__.masters(id,name) VALUES(88,'Legacy master')")
+            db.execute("INSERT INTO __APP_SCHEMA__.rooms(id,name) VALUES(99,'Legacy room')")
+            db.execute("INSERT INTO __APP_SCHEMA__.clients(id,vk_id,phone,phone_provided_at) VALUES(66,12345,'+79990000066','2025-01-01T00:00:00Z')")
+            db.execute("""INSERT INTO __APP_SCHEMA__.bookings(id,client_id,service_id,master_id,room_id,start_utc,end_utc,
                 source,status,phone_snapshot,service_name_snapshot,master_name_snapshot,created_at,updated_at)
                 VALUES(55,66,77,88,99,'2050-01-01T10:00:00Z','2050-01-01T10:30:00Z','admin','confirmed',
                  '+79990000066','Legacy service','Legacy master','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')""")
-            db.execute("INSERT INTO public.booking_history VALUES(44,55,'confirmed','legacy','{}','2025-01-01T00:00:00Z')")
-            db.execute("""INSERT INTO public.admin_users(id,username,password_salt,password_hash,password_iterations,created_at,password_changed_at)
+            db.execute("INSERT INTO __APP_SCHEMA__.booking_history VALUES(44,55,'confirmed','legacy','{}','2025-01-01T00:00:00Z')")
+            db.execute("""INSERT INTO __APP_SCHEMA__.admin_users(id,username,password_salt,password_hash,password_iterations,created_at,password_changed_at)
                 VALUES(33,'legacy_admin',?,?,100000,'2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')""", (b"s" * 16, b"h" * 32))
-            db.execute("""INSERT INTO public.admin_sessions(id,admin_user_id,token_hash,created_at,last_seen_at,expires_at)
+            db.execute("""INSERT INTO __APP_SCHEMA__.admin_sessions(id,admin_user_id,token_hash,created_at,last_seen_at,expires_at)
                 VALUES(22,33,?,'2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2050-01-01T00:00:00Z')""", (b"t" * 32,))
-            db.execute("INSERT INTO public.admin_audit_log VALUES(11,'admin:33','login','admin_session','22','{}','2025-01-01T00:00:00Z')")
-            cls.before = {t: [dict(r) for r in db.execute(f"SELECT * FROM public.{t} ORDER BY id")]
+            db.execute("INSERT INTO __APP_SCHEMA__.admin_audit_log VALUES(11,'admin:33','login','admin_session','22','{}','2025-01-01T00:00:00Z')")
+            cls.before = {t: [dict(r) for r in db.execute(f"SELECT * FROM __APP_SCHEMA__.{t} ORDER BY id")]
                           for t in ("services", "masters", "rooms", "clients", "bookings", "booking_history", "admin_sessions")}
             db.execute("BEGIN IMMEDIATE")
             cls.policy = {**POLICY, "slot_step_minutes": 15}
@@ -133,7 +136,7 @@ class SharedPostgres(unittest.TestCase):
             db.commit()
             db.execute("BEGIN IMMEDIATE")
             cls.salon2 = provision_salon(db, "Second salon", {**POLICY, "timezone": "UTC"})
-            db.execute("INSERT INTO public.salon_memberships(salon_id,user_id) VALUES(?,33)", (cls.salon2,))
+            db.execute("INSERT INTO __APP_SCHEMA__.salon_memberships(salon_id,user_id) VALUES(?,33)", (cls.salon2,))
             db.commit()
         finally:
             db.close()
@@ -148,15 +151,15 @@ class SharedPostgres(unittest.TestCase):
     def fixture(self, db=None, shared=None):
         db = db or self.db
         token = uuid4().hex
-        service = db.execute("INSERT INTO public.services(name,duration_minutes) VALUES(?,30) RETURNING id,entity_id", (token,)).fetchone()
-        master = db.execute("INSERT INTO public.masters(name,shared_master_id) VALUES(?,?) RETURNING id,entity_id,shared_master_id", (token, shared)).fetchone()
-        room = db.execute("INSERT INTO public.rooms(name) VALUES(?) RETURNING id,entity_id", (token,)).fetchone()
+        service = db.execute("INSERT INTO __APP_SCHEMA__.services(name,duration_minutes) VALUES(?,30) RETURNING id,entity_id", (token,)).fetchone()
+        master = db.execute("INSERT INTO __APP_SCHEMA__.masters(name,shared_master_id) VALUES(?,?) RETURNING id,entity_id,shared_master_id", (token, shared)).fetchone()
+        room = db.execute("INSERT INTO __APP_SCHEMA__.rooms(name) VALUES(?) RETURNING id,entity_id", (token,)).fetchone()
         return service, master, room
 
     @staticmethod
     def booking(db, fixture, phone, start="2050-02-01T10:00:00Z", end="2050-02-01T10:30:00Z"):
         service, master, room = fixture
-        return db.execute("""INSERT INTO public.bookings(service_id,master_id,room_id,start_utc,end_utc,source,status,
+        return db.execute("""INSERT INTO __APP_SCHEMA__.bookings(service_id,master_id,room_id,start_utc,end_utc,source,status,
             phone_snapshot,service_name_snapshot,master_name_snapshot,created_at,updated_at)
             VALUES(?,?,?,?,?,'admin','confirmed',?,?,?,'2025-01-01T00:00:00Z','2025-01-01T00:00:00Z') RETURNING id""",
             (service["id"], master["id"], room["id"], start, end, phone, "service", "master")).fetchone()[0]
@@ -165,19 +168,19 @@ class SharedPostgres(unittest.TestCase):
         for table, rows in self.before.items():
             keys = tuple(rows[0])
             # Project precisely the old columns; technical columns are additions.
-            after = [dict(r) for r in self.db.execute(f"SELECT {','.join(keys)} FROM public.{table} WHERE id=?", (rows[0]["id"],))]
+            after = [dict(r) for r in self.db.execute(f"SELECT {','.join(keys)} FROM __APP_SCHEMA__.{table} WHERE id=?", (rows[0]["id"],))]
             self.assertEqual(rows, after, table)
-        self.assertEqual(self.db.execute("SELECT user_id FROM public.salon_memberships WHERE salon_id=1").fetchone()[0], 33)
-        self.assertEqual(self.db.execute("SELECT id FROM public.account_audit_log WHERE action='login'").fetchone()[0], 11)
+        self.assertEqual(self.db.execute("SELECT user_id FROM __APP_SCHEMA__.salon_memberships WHERE salon_id=1").fetchone()[0], 33)
+        self.assertEqual(self.db.execute("SELECT id FROM __APP_SCHEMA__.account_audit_log WHERE action='login'").fetchone()[0], 11)
         before = constructor_snapshot(self.db)
         self.db.execute("BEGIN IMMEDIATE")
         upgrade_shared(self.db)
         self.db.commit()
         self.assertEqual(before, constructor_snapshot(self.db))
-        self.assertEqual(self.db.execute("SELECT max(version) FROM public.schema_migrations").fetchone()[0], 4)
-        self.assertIsNone(self.db.execute("SELECT to_regclass('public.one_active_admin')").fetchone()[0])
+        self.assertEqual(self.db.execute("SELECT max(version) FROM __APP_SCHEMA__.schema_migrations").fetchone()[0], 4)
+        self.assertIsNone(self.db.execute("SELECT to_regclass('__APP_SCHEMA__.one_active_admin')").fetchone()[0])
         for table in SALON_TABLES:
-            flags = self.db.execute("SELECT relrowsecurity,relforcerowsecurity FROM pg_class WHERE oid=to_regclass(?)", ("public." + table,)).fetchone()
+            flags = self.db.execute("SELECT relrowsecurity,relforcerowsecurity FROM pg_class WHERE oid=to_regclass(?)", (relation_name(self.db, table),)).fetchone()
             self.assertEqual(tuple(flags.values()), (True, True), table)
 
     def test_02_salon_isolation_missing_context_and_shared_accounts(self):
@@ -185,15 +188,15 @@ class SharedPostgres(unittest.TestCase):
         try:
             a = self.fixture()
             b = self.fixture(second)
-            self.assertIsNone(second.execute("SELECT id FROM public.services WHERE id=?", (a[0]["id"],)).fetchone())
-            self.assertIsNone(self.db.execute("SELECT id FROM public.services WHERE id=?", (b[0]["id"],)).fetchone())
+            self.assertIsNone(second.execute("SELECT id FROM __APP_SCHEMA__.services WHERE id=?", (a[0]["id"],)).fetchone())
+            self.assertIsNone(self.db.execute("SELECT id FROM __APP_SCHEMA__.services WHERE id=?", (b[0]["id"],)).fetchone())
             self.assertEqual(get_policy(self.db), self.policy)
             self.assertEqual(get_policy(second)["timezone"], "UTC")
-            self.assertEqual(second.execute("SELECT count(*) FROM public.salon_memberships WHERE user_id=33").fetchone()[0], 2)
+            self.assertEqual(second.execute("SELECT count(*) FROM __APP_SCHEMA__.salon_memberships WHERE user_id=33").fetchone()[0], 2)
             second.execute("SELECT set_config('app.salon_id','',false)")
-            self.assertEqual(second.execute("SELECT count(*) FROM public.services").fetchone()[0], 0)
+            self.assertEqual(second.execute("SELECT count(*) FROM __APP_SCHEMA__.services").fetchone()[0], 0)
             with self.assertRaises(Exception):
-                second.execute("INSERT INTO public.services(name,duration_minutes) VALUES('no-context',30)")
+                second.execute("INSERT INTO __APP_SCHEMA__.services(name,duration_minutes) VALUES('no-context',30)")
         finally:
             second.close()
 
@@ -202,11 +205,11 @@ class SharedPostgres(unittest.TestCase):
         try:
             a, b = self.fixture(), self.fixture(second)
             with self.assertRaises(Exception):
-                self.db.execute("INSERT INTO public.master_services(master_id,service_id) VALUES(?,?)", (a[1]["id"], b[0]["id"]))
-            self.assertEqual(self.db.execute("SELECT count(*) FROM public.master_services WHERE master_id=?", (a[1]["id"],)).fetchone()[0], 0)
+                self.db.execute("INSERT INTO __APP_SCHEMA__.master_services(master_id,service_id) VALUES(?,?)", (a[1]["id"], b[0]["id"]))
+            self.assertEqual(self.db.execute("SELECT count(*) FROM __APP_SCHEMA__.master_services WHERE master_id=?", (a[1]["id"],)).fetchone()[0], 0)
             t = create_type(self.db, "custom_" + uuid4().hex, "Custom")
             p = save_parameter(self.db, {"entity_type_id": t["id"], "code": "ref", "label": "Ref", "data_type": "reference",
-                "reference_type_id": self.db.execute("SELECT id FROM public.entity_types WHERE salon_id=1 AND code='service'").fetchone()[0]})
+                "reference_type_id": self.db.execute("SELECT id FROM __APP_SCHEMA__.entity_types WHERE salon_id=1 AND code='service'").fetchone()[0]})
             with self.assertRaises(ConstructorError):
                 save_entity(self.db, {"entity_type_id": t["id"], "values": {p["code"]: b[0]["entity_id"]}})
             self.assertFalse(any(e["entity_type_id"] == t["id"] for e in constructor_snapshot(self.db)["entities"]))
@@ -234,7 +237,7 @@ class SharedPostgres(unittest.TestCase):
 
     def test_05_core_extras_and_projection_commands_are_atomic(self):
         a = self.fixture()
-        core_type = self.db.execute("SELECT id FROM public.entity_types WHERE salon_id=1 AND code='service'").fetchone()[0]
+        core_type = self.db.execute("SELECT id FROM __APP_SCHEMA__.entity_types WHERE salon_id=1 AND code='service'").fetchone()[0]
         with self.assertRaises(ConstructorError):
             save_parameter(self.db, {"entity_type_id": core_type, "code": "required_extra", "label": "Required extra", "data_type": "string", "required": True})
         save_parameter(self.db, {"entity_type_id": core_type, "code": "description_" + uuid4().hex[:8], "label": "Description", "data_type": "string"})
@@ -245,14 +248,14 @@ class SharedPostgres(unittest.TestCase):
         with self.assertRaises(ConstructorError):
             archive_entity(self.db, a[0]["entity_id"])
         with self.assertRaises(Exception):
-            self.db.execute("""UPDATE public.entity_parameter_values SET value_integer=60
-                WHERE salon_id=1 AND entity_id=? AND parameter_id=(SELECT id FROM public.entity_parameters
+            self.db.execute("""UPDATE __APP_SCHEMA__.entity_parameter_values SET value_integer=60
+                WHERE salon_id=1 AND entity_id=? AND parameter_id=(SELECT id FROM __APP_SCHEMA__.entity_parameters
                   WHERE salon_id=1 AND entity_type_id=? AND code='duration_minutes')""", (a[0]["entity_id"], core_type))
-        self.db.execute("UPDATE public.services SET duration_minutes=45 WHERE id=?", (a[0]["id"],))
+        self.db.execute("UPDATE __APP_SCHEMA__.services SET duration_minutes=45 WHERE id=?", (a[0]["id"],))
         entity = next(e for e in constructor_snapshot(self.db)["entities"] if e["id"] == a[0]["entity_id"])
         self.assertEqual(entity["values"]["duration_minutes"], 45)
-        settings = self.db.execute("SELECT id FROM public.entity_types WHERE salon_id=1 AND code='salon_settings'").fetchone()[0]
-        settings_entity = self.db.execute("SELECT id FROM public.entities WHERE salon_id=1 AND entity_type_id=?", (settings,)).fetchone()[0]
+        settings = self.db.execute("SELECT id FROM __APP_SCHEMA__.entity_types WHERE salon_id=1 AND code='salon_settings'").fetchone()[0]
+        settings_entity = self.db.execute("SELECT id FROM __APP_SCHEMA__.entities WHERE salon_id=1 AND entity_type_id=?", (settings,)).fetchone()[0]
         code = "number_" + uuid4().hex[:8]
         save_parameter(self.db, {"entity_type_id": settings, "code": code, "label": "Number", "data_type": "number"})
         save_entity(self.db, {"id": settings_entity, "values": {code: 1.5}})
@@ -268,17 +271,17 @@ class SharedPostgres(unittest.TestCase):
             with self.assertRaises(Exception):
                 self.booking(self.db, self.fixture(), "+79990000100")  # same-salon collision
             attached = self.fixture(second, a[1]["shared_master_id"])
-            self.assertTrue(second.execute("SELECT public.shared_master_conflict(?,?,?,NULL)",
+            self.assertTrue(second.execute("SELECT __APP_SCHEMA__.shared_master_conflict(?,?,?,NULL)",
                 (attached[1]["id"], "2050-02-01T10:00:00Z", "2050-02-01T10:30:00Z")).fetchone()[0])
             with self.assertRaises(Exception):
                 self.booking(second, attached, "+79990000200")
             self.booking(second, attached, "+79990000201", "2050-02-01T10:30:00Z", "2050-02-01T11:00:00Z")
-            self.db.execute("UPDATE public.bookings SET status='cancelled' WHERE id=?", (first_id,))
-            self.assertFalse(second.execute("SELECT public.shared_master_conflict(?,?,?,NULL)",
+            self.db.execute("UPDATE __APP_SCHEMA__.bookings SET status='cancelled' WHERE id=?", (first_id,))
+            self.assertFalse(second.execute("SELECT __APP_SCHEMA__.shared_master_conflict(?,?,?,NULL)",
                 (attached[1]["id"], "2050-02-01T10:00:00Z", "2050-02-01T10:30:00Z")).fetchone()[0])
             self.booking(second, attached, "+79990000200")
             with self.assertRaises(Exception):
-                second.execute("SELECT public.shared_master_conflict(?,?,?,NULL)",
+                second.execute("SELECT __APP_SCHEMA__.shared_master_conflict(?,?,?,NULL)",
                     (a[1]["id"], "2050-02-01T10:00:00Z", "2050-02-01T10:30:00Z"))
         finally:
             second.close()
@@ -312,14 +315,14 @@ class SharedPostgres(unittest.TestCase):
         t = create_type(self.db, "required_" + uuid4().hex, "Required")
         p = save_parameter(self.db, {"entity_type_id": t["id"], "code": "value", "label": "Value", "data_type": "integer", "required": True})
         self.db.execute("BEGIN")
-        eid = self.db.execute("INSERT INTO public.entities(salon_id,entity_type_id) VALUES(1,?) RETURNING id", (t["id"],)).fetchone()[0]
+        eid = self.db.execute("INSERT INTO __APP_SCHEMA__.entities(salon_id,entity_type_id) VALUES(1,?) RETURNING id", (t["id"],)).fetchone()[0]
         with self.assertRaises(Exception):
-            self.db.execute("""INSERT INTO public.entity_parameter_values(salon_id,entity_id,parameter_id,entity_type_id,value_string)
+            self.db.execute("""INSERT INTO __APP_SCHEMA__.entity_parameter_values(salon_id,entity_id,parameter_id,entity_type_id,value_string)
                 VALUES(1,?,?,?,'wrong')""", (eid, p["id"], t["id"]))
         self.db.rollback()
 
         self.db.execute("BEGIN")
-        self.db.execute("INSERT INTO public.entities(salon_id,entity_type_id) VALUES(1,?)", (t["id"],))
+        self.db.execute("INSERT INTO __APP_SCHEMA__.entities(salon_id,entity_type_id) VALUES(1,?)", (t["id"],))
         with self.assertRaises(Exception):
             self.db.commit()
         self.db.rollback()
@@ -341,11 +344,11 @@ class SharedPostgres(unittest.TestCase):
         empty = save_entity(self.db, {"entity_type_id": t["id"], "values": {}})
         for nonfinite in ("NaN", "Infinity", "-Infinity"):
             with self.assertRaises(Exception) as caught:
-                self.db.execute("""UPDATE public.entity_parameter_values SET value_number=?::numeric
+                self.db.execute("""UPDATE __APP_SCHEMA__.entity_parameter_values SET value_number=?::numeric
                     WHERE salon_id=1 AND entity_id=? AND parameter_id=?""", (nonfinite, existing["id"], p["id"]))
             self.assertEqual(getattr(caught.exception, "sqlstate", None), "23514")
             with self.assertRaises(Exception) as caught:
-                self.db.execute("""INSERT INTO public.entity_parameter_values
+                self.db.execute("""INSERT INTO __APP_SCHEMA__.entity_parameter_values
                     (salon_id,entity_id,parameter_id,entity_type_id,value_number)
                     VALUES(1,?,?,?,?::numeric)""", (empty["id"], p["id"], t["id"], nonfinite))
             self.assertEqual(getattr(caught.exception, "sqlstate", None), "23514")

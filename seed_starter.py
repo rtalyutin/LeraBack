@@ -14,7 +14,7 @@ def seed(path):
     if data["status"] != "approved_synthetic_only":
         raise ValueError("Expected synthetic starter data")
     with connect(path) as db:
-        if db.execute("SELECT to_regclass('public.services')").fetchone()[0] is not None:
+        if db.execute("SELECT to_regclass('__APP_SCHEMA__.services')").fetchone()[0] is not None:
             raise ValueError("Starter data requires a fresh empty database")
         migrate(db)
     with connect(SalonScope(path, 1)) as db:
@@ -30,7 +30,7 @@ def seed(path):
             db.executemany("INSERT INTO rooms(id,name) VALUES (?,?)",
                            [(r["id"], r["name"]) for r in data["rooms"]])
             for table in ("services", "masters", "rooms"):
-                db.execute(f"SELECT setval(pg_get_serial_sequence('public.{table}', 'id'), "
+                db.execute(f"SELECT setval(pg_get_serial_sequence('__APP_SCHEMA__.{table}', 'id'), "
                            f"(SELECT max(id) FROM {table}), true)")
             db.executemany("INSERT INTO master_services VALUES (?,?)",
                            [(m["id"], sid) for m in data["masters"] for sid in m["service_ids"]])

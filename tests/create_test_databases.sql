@@ -4,3 +4,4 @@ CREATE DATABASE constructor_test OWNER lera_test;
 CREATE DATABASE startup_test OWNER lera_test;
 CREATE DATABASE shared_schema_test OWNER lera_test;
 CREATE DATABASE multisalon_test OWNER lera_test;
+CREATE DATABASE namespace_test OWNER lera_test;

@@ -35,7 +35,7 @@ class MultisalonIntegration(unittest.TestCase):
         if not urlsplit(URL).path.endswith("_test"):
             raise ValueError("Use a fresh disposable *_test database")
         with connect(URL) as db:
-            if db.execute("SELECT to_regclass('public.salons')").fetchone()[0]:
+            if db.execute("SELECT to_regclass('__APP_SCHEMA__.salons')").fetchone()[0]:
                 raise ValueError("Multisalon test database must be fresh")
             migrate(db)
         cls.owner = create_or_update_admin(URL, "both_salons", PASSWORD)

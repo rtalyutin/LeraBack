@@ -36,15 +36,19 @@ def migrate(db) -> None:
         raise ValueError("Migrations require an unscoped developer connection")
     try:
         db.execute("BEGIN IMMEDIATE")
-        exists = db.execute("SELECT to_regclass('public.schema_migrations')").fetchone()[0]
-        version = db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] if exists else 0
+        exists = db.execute("SELECT to_regclass('__APP_SCHEMA__.schema_migrations')").fetchone()[0]
+        version = db.execute("SELECT max(version) FROM __APP_SCHEMA__.schema_migrations").fetchone()[0] if exists else 0
+        if (version or 0) > 4:
+            raise RuntimeError("Selected database schema is newer than supported version 4")
         if (version or 0) < 4:
             db.execute(SCHEMA.read_text(encoding="utf-8"))
-            db.execute("ALTER TABLE services DROP CONSTRAINT IF EXISTS services_duration_minutes_check")
-            db.execute("ALTER TABLE services ADD CONSTRAINT services_duration_minutes_check CHECK (duration_minutes BETWEEN 1 AND 1440)")
+            db.execute("ALTER TABLE __APP_SCHEMA__.services DROP CONSTRAINT IF EXISTS services_duration_minutes_check")
+            db.execute("ALTER TABLE __APP_SCHEMA__.services ADD CONSTRAINT services_duration_minutes_check CHECK (duration_minutes BETWEEN 1 AND 1440)")
             for number in (1, 2, 3):
-                db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES (?, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) ON CONFLICT DO NOTHING", (number,))
-            upgrade_shared(db)
+                db.execute("INSERT INTO __APP_SCHEMA__.schema_migrations(version,applied_at) VALUES (?, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) ON CONFLICT DO NOTHING", (number,))
+        # Version 4 has repeatable function/trigger/policy repairs. Refresh it
+        # under the same transaction/lock without replaying legacy DDL/backfill.
+        upgrade_shared(db)
         db.commit()
     except Exception:
         db.rollback()
@@ -141,7 +145,7 @@ def _unbooked(db, kind, resource_id, start, end, buffer_minutes, except_id=None)
     pad = timedelta(minutes=buffer_minutes)
     if kind == "master":
         return not db.execute(
-            "SELECT public.shared_master_conflict(?,?,?,?)",
+            "SELECT __APP_SCHEMA__.shared_master_conflict(?,?,?,?)",
             (resource_id, stamp(start - pad), stamp(end + pad), except_id),
         ).fetchone()[0]
     return db.execute(

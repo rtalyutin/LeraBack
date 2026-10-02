@@ -26,7 +26,7 @@ class ConstructorIntegration(unittest.TestCase):
         if not urlsplit(RAW_URL).path.endswith("_test"):
             raise ValueError("Use a fresh disposable *_test database")
         with closing(connect(RAW_URL)) as db:
-            if db.execute("SELECT to_regclass('public.services')").fetchone()[0] is not None:
+            if db.execute("SELECT to_regclass('__APP_SCHEMA__.services')").fetchone()[0] is not None:
                 raise ValueError("Constructor test database must be fresh")
             migrate(db)
         cls.now = datetime.now(UTC)

@@ -30,13 +30,13 @@ def shared_masters(scope, user_id):
         raise AuthorizationError("Salon access denied")
     with closing(connect(scope)) as db:
         attached = {row[0] for row in db.execute(
-            "SELECT shared_master_id FROM public.masters WHERE salon_id=?", (scope.salon_id,))}
+            "SELECT shared_master_id FROM __APP_SCHEMA__.masters WHERE salon_id=?", (scope.salon_id,))}
     result = []
     for salon in allowed:
         if salon["id"] == scope.salon_id:
             continue
         with closing(connect(SalonScope(scope.url, salon["id"]))) as db:
-            for row in db.execute("SELECT id,name,shared_master_id FROM public.masters WHERE salon_id=? AND active=1 ORDER BY name", (salon["id"],)):
+            for row in db.execute("SELECT id,name,shared_master_id FROM __APP_SCHEMA__.masters WHERE salon_id=? AND active=1 ORDER BY name", (salon["id"],)):
                 if row["shared_master_id"] not in attached:
                     result.append({"source_salon_id": salon["id"], "source_salon_name": salon["name"],
                                    "master_id": row["id"], "name": row["name"],
@@ -54,7 +54,7 @@ def attach_master(scope, user_id, source_salon_id, master_id, service_ids, activ
     # Read the source through its own scope; arbitrary global identity IDs are never accepted.
     require_salon(scope.url, user_id, source_salon_id)
     with closing(connect(SalonScope(scope.url, source_salon_id))) as source:
-        row = source.execute("SELECT id,name,shared_master_id FROM public.masters WHERE salon_id=? AND id=? AND active=1",
+        row = source.execute("SELECT id,name,shared_master_id FROM __APP_SCHEMA__.masters WHERE salon_id=? AND id=? AND active=1",
                              (source_salon_id, master_id)).fetchone()
     if row is None:
         raise LookupError("Source master not found")
@@ -74,7 +74,7 @@ def attach_master(scope, user_id, source_salon_id, master_id, service_ids, activ
                 if not db.execute("SELECT 1 FROM services WHERE id=?", (service_id,)).fetchone():
                     raise ValueError("Unknown salon service")
             profile_id = db.execute(
-                "INSERT INTO public.masters(salon_id,name,active,shared_master_id) VALUES (?,?,?,?)",
+                "INSERT INTO __APP_SCHEMA__.masters(salon_id,name,active,shared_master_id) VALUES (?,?,?,?)",
                 (scope.salon_id, name, int(active), row["shared_master_id"])).lastrowid
             db.executemany("INSERT INTO master_services(master_id,service_id) VALUES (?,?)",
                            [(profile_id, sid) for sid in sorted(set(service_ids))])
