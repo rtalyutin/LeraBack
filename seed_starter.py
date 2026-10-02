@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from booking_core import connect, migrate
+from pg_store import SalonScope
 
 STARTER = Path(__file__).with_name("starter_data.json")
 
@@ -16,6 +17,7 @@ def seed(path):
         if db.execute("SELECT to_regclass('public.services')").fetchone()[0] is not None:
             raise ValueError("Starter data requires a fresh empty database")
         migrate(db)
+    with connect(SalonScope(path, 1)) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
             if any(db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
@@ -28,7 +30,7 @@ def seed(path):
             db.executemany("INSERT INTO rooms(id,name) VALUES (?,?)",
                            [(r["id"], r["name"]) for r in data["rooms"]])
             for table in ("services", "masters", "rooms"):
-                db.execute(f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
+                db.execute(f"SELECT setval(pg_get_serial_sequence('public.{table}', 'id'), "
                            f"(SELECT max(id) FROM {table}), true)")
             db.executemany("INSERT INTO master_services VALUES (?,?)",
                            [(m["id"], sid) for m in data["masters"] for sid in m["service_ids"]])

@@ -12,6 +12,8 @@ from booking_core import connect
 REQUIRED_TABLES = {
     "schema_migrations", "services", "masters", "rooms", "bookings",
     "admin_users", "admin_sessions", "inbound_events", "vk_outgoing_messages",
+    "accounts", "salons", "salon_memberships", "shared_masters", "shared_master_busy",
+    "entity_types", "entities", "entity_parameters", "entity_parameter_values",
 }
 
 
@@ -20,10 +22,9 @@ def database_health(url):
         with closing(connect(url)) as db:
             db.execute("SELECT 1").fetchone()
             version = db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0]
-            pending = db.execute(
-                "SELECT count(*) FROM vk_outgoing_messages WHERE status IN ('pending','failed')"
-            ).fetchone()[0]
-        return {"status": "ok", "schema_version": version, "outgoing_attention": pending}
+            if version is None or version < 4:
+                return {"status": "error"}
+        return {"status": "ok", "schema_version": version}
     except Exception:
         return {"status": "error"}
 

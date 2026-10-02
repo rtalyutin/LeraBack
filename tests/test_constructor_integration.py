@@ -11,8 +11,10 @@ from uuid import uuid4
 from admin_service import (AdminConflict, create_manual_booking, create_service,
                            save_resource, snapshot, update_service, update_weekly_schedule)
 from booking_core import connect, get_available_slots, migrate
+from pg_store import SalonScope
 
-URL = os.environ.get("CONSTRUCTOR_TEST_DATABASE_URL", "")
+RAW_URL = os.environ.get("CONSTRUCTOR_TEST_DATABASE_URL", "")
+URL = SalonScope(RAW_URL, 1) if RAW_URL else None
 POLICY = json.loads(Path(__file__).resolve().parents[1].joinpath(".env.example").read_text().split("SALON_POLICY_JSON=", 1)[1].splitlines()[0])
 UTC = timezone.utc
 
@@ -21,9 +23,9 @@ UTC = timezone.utc
 class ConstructorIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if not urlsplit(URL).path.endswith("_test"):
+        if not urlsplit(RAW_URL).path.endswith("_test"):
             raise ValueError("Use a fresh disposable *_test database")
-        with closing(connect(URL)) as db:
+        with closing(connect(RAW_URL)) as db:
             if db.execute("SELECT to_regclass('public.services')").fetchone()[0] is not None:
                 raise ValueError("Constructor test database must be fresh")
             migrate(db)
@@ -114,9 +116,10 @@ class ConstructorIntegration(unittest.TestCase):
             save_resource(URL, "room", rid, "Ошибка", [99999999], True, self.actor)
         with closing(connect(URL)) as db:
             before = [dict(r) for r in db.execute("SELECT * FROM services ORDER BY id")]
-            migrate(db)
-            migrate(db)
+            with closing(connect(RAW_URL)) as migration_db:
+                migrate(migration_db)
+                migrate(migration_db)
             after = [dict(r) for r in db.execute("SELECT * FROM services ORDER BY id")]
             self.assertEqual(before, after)
-            self.assertEqual(db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0], 3)
+            self.assertEqual(db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0], 4)
         update_service(URL, sid, "Длинный приём "+uuid4().hex, 150, True, self.actor)

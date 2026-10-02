@@ -1,65 +1,87 @@
-# LeraBack — prepared PostgreSQL backend
+# LeraBack — общая база салонов
 
-One Timeweb App Platform application serves the admin API (`/api/*`), health (`/healthz`) and VK Callback API (`/vk/callback`). Its one in-process outgoing worker starts only when callback configuration and `VK_COMMUNITY_TOKEN` are both present. The frontend is a separate application; the database is a separate managed PostgreSQL service. The constructor has been verified locally against PostgreSQL 16.15 and Chrome; **Timeweb deployment and real VK delivery have not been verified**.
+Один backend и одна PostgreSQL обслуживают несколько салонов. LeraFront остаётся отдельным приложением; в Timeweb сохраняются три сервиса: фронт, бэк, БД.
 
-## First launch and admin constructor
+## Что хранится вместе
 
-The Docker command `python app.py` now applies the repeatable schema migration before opening the HTTP server. On a database with no administrator accounts, it creates the first administrator from `SALON_ADMIN_USERNAME` (default `salon_admin`) and `SALON_ADMIN_PASSWORD` (12–256 characters). Set these through the hosting environment; the example password is rejected. A restart retains existing credentials and sessions, even if bootstrap variables remain set. Remove `SALON_ADMIN_PASSWORD` from hosting settings after the first successful login. Disabled accounts require developer recovery; startup never reactivates them.
+`accounts` — общие аккаунты, `salons` — реестр салонов, `salon_memberships` — доступ аккаунта к одному или нескольким салонам. Публичной регистрации нет. Существующий `admin_users` остаётся совместимым представлением аккаунтов; действующие сессии сохраняются.
 
-See [TIMEWEB.md](TIMEWEB.md) for the three-service setup, exact variables and checks. No manual database initialization or interactive password prompt is needed for the normal Docker startup.
+Услуги, профили мастеров, кабинеты, расписания, клиенты, записи, история, диалоги VK, входящие события, результаты действий и очереди сообщений находятся в общих физических таблицах с `salon_id`. Индексы и внешние ключи учитывают владельца. PostgreSQL RLS включён с FORCE; без контекста салона закрывает доменные строки для обычной роли. Приложению нужен пользователь БД **NOSUPERUSER NOBYPASSRLS**, владеющий схемой для миграций. Superuser/BYPASSRLS не обеспечивают эту защиту. Прямой доступ клиентов к БД не предоставляется.
 
-### Developer maintenance
+Мастер имеет общую техническую личность `shared_masters` и отдельный профиль `masters` в каждом салоне. Услуги и часы профиля независимы. Его занятость проверяется между салонами; exclusion constraint запрещает пересекающиеся подтверждённые записи одного человека. Кабинет и клиент/телефон проверяются внутри салона. Подтверждённые записи поддерживают isolation level READ COMMITTED; DB guard отклоняет другие уровни. Общий advisory lock пока сохраняет последовательное выполнение команд; производительность нескольких салонов не измерялась.
 
-Set `DATABASE_URL` through the hosting environment, ideally with `sslmode=require`; do not commit credentials. From a trusted environment with access to the database:
+## Конструктор данных
+
+Каноническая модель: `entity_types`, `entities`, `entity_parameters`, `entity_parameter_values`. Значения хранятся в отдельных типизированных колонках: string, integer, number, boolean, date, reference. Ограничения проверяют тип, обязательность и принадлежность ссылки тому же салону и объявленному типу.
+
+Доменные таблицы — совместимые проекции. Их изменения через существующие сервисные команды и канонические значения синхронизируются триггерами в одной транзакции. Системные типы/поля generic API менять не позволяет: услуги, мастера, кабинеты и часы редактируются через прежние команды, включая подтверждение отмены затронутых записей. Дополнительные поля системных типов допускаются только необязательными. Для собственных справочников доступны создание типов, полей и записей; обязательные поля допустимы. Заполненное поле нельзя удалить или сменить его тип без предварительной очистки данных.
+
+После входа администратор выбирает салон и собирает его: услуги → мастера → кабинеты → часы и перерывы. Новый ресурс не получает часы автоматически. Во вкладке «Свои справочники» создаются дополнительные типы данных. Общего мастера можно подключить из другого салона, доступного тому же аккаунту; глобальный ID сам по себе права на подключение не даёт.
+
+## API
+
+Вход, сессия и выход остаются `/api/login`, `/api/session`, `/api/logout`. В session/login добавлен `salons: [{id,name,role}]`; `/api/salons` возвращает доступные салоны. Все рабочие запросы требуют **X-Salon-Id**. Сервер проверяет членство для каждого запроса; отсутствие выбора — 422, чужой салон — 403. Все POST кроме входа также требуют сессию и `X-CSRF-Token`.
+
+- `GET /api/snapshot?date=YYYY-MM-DD`: каталог, расписание, записи выбранного салона; строки каталога содержат `entity_id`.
+- `POST /api/services`, `/api/services/{id}`: создание/редактирование услуги `{name,duration_minutes,active?}`.
+- `POST /api/masters`, `/api/rooms` и варианты `/{id}`: `{name,service_ids,active}`.
+- `POST /api/weekly-schedule`: `{resource_kind,resource_id,weekday,intervals:[{start_minute,end_minute}]}`; пустые интервалы означают выходной.
+- `GET /api/shared-masters`: профили из других доступных салонов.
+- `POST /api/masters/attach`: `{source_salon_id,master_id,service_ids,active?,name?}`.
+- `GET /api/constructor`: системные и собственные типы, параметры и записи текущего салона.
+- `POST /api/constructor/types`: `{code,label}`; `/{id}` меняет label собственного типа.
+- `POST /api/constructor/parameters`: `{entity_type_id,code,label,data_type,required?,reference_type_id?}`; `/{id}` меняет описание/тип/обязательность собственного незаполненного поля. При переходе со ссылки к scalar нужно `reference_type_id:null`.
+- `POST /api/constructor/entities`: `{entity_type_id,values:{code:value}}`; `/{id}` принимает `{values}`. Для системной записи — только дополнительные поля.
+
+Изменение доступности, затрагивающее записи, сначала возвращает 409 и ничего не меняет. Повтор с `acknowledge:true` сохраняет прежние правила отмены/оповещения. Встреча, уже начавшаяся, этим изменением не отменяется. Идемпотентность, VK ID и ключи сообщений разделены по салонам.
+
+## Миграция и управляемое добавление салонов
+
+`python app.py` применяет миграцию 4 атомарно до запуска HTTP. Старые строки переходят в салон 1 с прежними ID; история, аккаунты и сессии сохраняются. Повторный старт не пересоздаёт данные и не меняет пароль. `SALON_POLICY_JSON`, если задан при первой миграции, переносится в настройки первого салона. После миграции правила берутся из типизированных настроек салона; изменение переменной не перезаписывает их.
+
+Первый аккаунт создаётся из SALON_ADMIN_USERNAME/SALON_ADMIN_PASSWORD только при отсутствии аккаунтов. Пароль 12–256 символов; пример отклоняется. Удалите bootstrap password из настроек после входа. Отключённые аккаунты восстанавливает разработчик. Допускаются несколько активных аккаунтов; новые аккаунты не получают доступ ко всем салонам автоматически.
+
+Команды выполняются разработчиком с DATABASE_URL в окружении, без секретов в аргументах:
 
 ```sh
 python initialize.py
-python provision_admin.py salon_admin
+python provision_admin.py new_admin --salon-id 1
+python manage_salons.py create "Название второго салона" --user-id 1
+python manage_salons.py grant 2 1
+python manage_salons.py revoke 2 1
 python ops.py verify
 ```
 
-`initialize.py` can also be run separately. It creates the empty schema or applies migration 3 to an existing database and preserves catalog, schedules, bookings and administrator accounts. Migration 3 changes service duration to 1–1440 whole minutes (one day; overnight shifts remain unsupported). `provision_admin.py` is the explicit developer recovery/rotation command; it prompts for a password of at least 12 characters and revokes the administrator's sessions. The application rejects startup unless exactly one active administrator exists.
+Новый салон получает собственные описания системных типов и стандартные правила записи, пустой каталог и часы. `provision_admin.py` создаёт аккаунт или явно меняет его пароль, отзывая сессии. Первый аккаунт имеет доступ к салону 1; доступ остальных назначается явно.
 
-After login, the administrator builds the salon in LeraFront: services and durations → masters and their services → rooms and their services → weekly hours for both resource types. No fixed masters, rooms or 09:00–18:00 hours are required. A new resource has no opening hours until the administrator supplies them. Multiple intervals per weekday represent breaks; an empty interval list means a day off. Booking starts still follow the configured 30-minute grid and existing notice/cancellation/overlap rules.
+Старый backend со схемой 4 несовместим. Для возврата версии нужен согласованный план восстановления базы; простой запуск старого schema_postgres.sql поверх новой БД запрещён. `seed_starter.py` остаётся только синтетической фикстурой для свежей пустой БД.
 
-Existing test data is not deleted by this upgrade. `seed_starter.py` remains an **optional synthetic test fixture** for a fresh database only; do not run it after `initialize.py` or in a live database. No real salon names, photos, VK IDs or tokens are in this repository.
+## Переменные и VK
 
-### Constructor API
+DATABASE_URL, SALON_CSRF_SECRET (минимум 32 байта), PORT=8080, начальные SALON_ADMIN_USERNAME/PASSWORD и SALON_POLICY_JSON описаны в `.env.example`. Ключи БД/пароли остаются только на бэке. `/livez` проверяет процесс, `/healthz` — подключение и версию схемы.
 
-All writes require the administrator session and `X-CSRF-Token`. `GET /api/snapshot?date=YYYY-MM-DD` returns catalog, weekly openings and `service_ids` on every master and room.
+VK не включается без конфигурации. Один набор прежних VK_GROUP_ID/CALLBACK_SECRET/CONFIRMATION_CODE/COMMUNITY_TOKEN привязывается к VK_SALON_ID (по умолчанию 1, прежний салон). Несколько сообществ задаются приватной VK_INTEGRATIONS_JSON — массивом `{salon_id,group_id,secret,confirmation_code,token?,api_version?,master_photo_ids?}`. Каждый салон поддерживает одно сообщество VK; одно сообщество имеет одну привязку. Несколько сообществ одного салона отклоняются, чтобы его очередь не отправлялась чужим токеном. Не смешивайте JSON и прежние переменные. callback выбирает привязку по group_id и проверяет secret; worker использует отдельную очередь и токен привязки. Токены в конструктор и на фронт не попадают. Реальную отправку этой версии не проверяли.
 
-- `POST /api/services`: `{name, duration_minutes}` creates an active service.
-- `POST /api/services/{id}`: `{name, duration_minutes, active}` updates a service.
-- `POST /api/masters` or `/api/rooms`: `{name, service_ids: [integer, ...], active: boolean}` creates a resource.
-- `POST /api/masters/{id}` or `/api/rooms/{id}`: same fields update the resource. Deactivate with `active: false`; physical deletion is not exposed so booking history is preserved.
-- `POST /api/weekly-schedule`: `{resource_kind: "master"|"room", resource_id, weekday: 0..6, intervals: [{start_minute, end_minute}, ...]}` replaces that resource/day's weekly openings. Bounds: `0 <= start_minute < end_minute <= 1440`; intervals must not overlap. Adjacent intervals are merged. Legacy `start_minute`/`end_minute` remains supported.
+Одноразовая отправка требует явной привязки:
 
-Creates return HTTP 201, updates 200, invalid input 422, unknown objects 404. An availability change affecting active bookings returns 409 with `affected_booking_ids` and leaves all data unchanged. Only a deliberate retry with `acknowledge: true` may cancel future affected bookings; a visit already underway cannot be cancelled by changing resource availability or hours. Rename-only edits preserve bookings and their name/time snapshots. Existing notification/manual-contact behavior is retained.
+```sh
+python send_outbox.py --salon-id 1 --group-id 123 --limit 50
+```
 
-## Configuration
+## Проверки
 
-- `DATABASE_URL`: PostgreSQL connection URI. One authoritative database, used by API, callback and worker.
-- `SALON_POLICY_JSON`: the approved booking policy from `.env.example`, independent of catalog and working hours.
-- `SALON_CSRF_SECRET`: random secret of at least 32 bytes, stored in Timeweb secrets.
-- `SALON_ADMIN_USERNAME`: initial login, default `salon_admin`.
-- `SALON_ADMIN_PASSWORD`: required only when no administrator accounts exist. Never rotates an existing password; remove after the first successful login. Values from `.env.example` must be replaced.
-- `PORT`: container HTTP port, default `8080`; Timeweb handles public TLS.
-- Optional until VK test-community approval: `VK_GROUP_ID`, `VK_CALLBACK_SECRET`, `VK_CONFIRMATION_CODE`, `VK_COMMUNITY_TOKEN`, `VK_API_VERSION`, `VK_MASTER_PHOTO_IDS_JSON`. Supply callback fields as a complete set. The worker remains off without a token. Photo IDs must be genuine uploaded VK community photos.
+```sh
+python -m compileall -q .
+python -m unittest discover -s tests -v
+```
 
-Build the included `Dockerfile` as the backend App Platform service. The backend itself serves no frontend files. Connect its URL through `BACKEND_URL` in LeraFront. Register `/vk/callback` only after an authorized test-community run and deployment approval.
+Без переменных *_TEST_DATABASE_URL интеграционные проверки пропускаются; это не PASS базы. Для обычного PostgreSQL 16 подготовлены пять отдельных одноразовых БД и роль без обхода RLS:
 
-Configure Timeweb's process health check as `/livez`: unauthenticated HTTP 200 while the HTTP server is running, with no database call. `/healthz` remains the separate database readiness check (200 or 503). A successful `/livez` alone does not prove database connectivity, administrator login or booking behavior.
+```sh
+docker compose -f compose.test.yml up --build --abort-on-container-exit --exit-code-from tests
+docker compose -f compose.test.yml down
+```
 
-## Integrity and checks
+Набор проверяет прежние запись/конструктор/старт, перенос данных версии 3, typed EAV, внешние ссылки, RLS, ограничения и API нескольких салонов, общих мастеров и VK namespaces. Compose использует временный локальный PostgreSQL и синтетические пароли; никаких production credentials. Эта команда в текущей среде не выполнялась: Docker и обычный PostgreSQL недоступны.
 
-All service mutations use a transaction-scoped PostgreSQL advisory lock. A DB trigger protects master, room and client/phone overlap from a direct booking writer. Outgoing VK sends use the same lock through the send and state update, so a later cancellation is ordered after the in-flight send. A failed or ambiguous VK send retains the stable `random_id` for retry. This trades throughput for simple serial behavior suitable for one salon; it is not a production performance measurement.
-
-Run `python -m compileall -q .` and `python -m unittest discover -s tests -v`. With separate fresh disposable databases named `*_test`, set `TEST_DATABASE_URL` for the original booking suite and `CONSTRUCTOR_TEST_DATABASE_URL` for constructor tests (empty schema, creation/eligibility, split hours and break exclusion, 90-minute booking, confirmation/rollback, validation and repeatable migration). Each suite is skipped when its database variable is absent. The old SQLite backup commands are intentionally absent: Timeweb PostgreSQL backup, retention and restore need separate configuration and a restore rehearsal before release.
-
-Local verification (2026-09-30): the original 2 integration tests and 5 constructor tests passed against isolated PostgreSQL 16.15 databases; the 5 constructor tests were repeated after the Cyrillic-name validation fix. An independent verifier exercised availability boundaries, authenticated HTTP/CSRF, rollback after an injected failure, and competing confirmations. Chrome completed 16 checks through the real admin API: empty setup, catalog/eligibility, split hours, 90-minute booking, Moscow time with a Los Angeles browser timezone, confirmation/dismissal, manual-contact reminder and a 390px viewport. This used a local proxy, not the production Nginx/Timeweb deployment. The independent verifier's cloud browser could not access localhost, so that verifier's UI result remains unverified.
-
-For an existing installation, retain `DATABASE_URL` and `SALON_CSRF_SECRET` and redeploy the backend; the application applies the non-destructive migration automatically. Do not reseed or recreate the administrator. For a fresh installation, supply the first-launch variables above and configure the salon through the constructor.
-
-Startup verification (2026-10-01): `tests/test_startup.py` exercises initial credential creation, repeated starts/session retention, competing initial provisioners, disabled-account recovery and invalid configuration through 5 SQLite-backed auth units and 2 configuration/real-HTTP tests. SQLite does not verify the PostgreSQL adapter. The HTTP test uses an actually refused psycopg connection and confirms `/livez` 200 with `/healthz` 503. Set `STARTUP_TEST_DATABASE_URL` to a separate fresh `*_test` PostgreSQL database to run the additional acceptance case covering missing/invalid passwords, competing first starts, catalog/session retention and refusal to reactivate a disabled account. This gate was not executed in the current environment, which has no runnable PostgreSQL service. Timeweb startup and container builds remain unverified.
-
-Remaining release work: Timeweb configuration and deployment verification, backups/restore, and real VK connection/photo/delivery checks. PostgreSQL credentials and VK tokens must come from the hosting environment.
+Статус проверки текущей версии — в `VERIFICATION.md`. Исторические результаты прежнего односалонного приложения на PG16/Chrome не подтверждают эту миграцию. Проверка обычного PostgreSQL, браузерного рендера, Docker-сборки, Timeweb, TLS/backup restore и реальной VK-доставки ещё нужна перед выпуском. Настройка Timeweb — в `TIMEWEB.md`.

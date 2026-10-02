@@ -12,8 +12,8 @@ def prepare_database(database_url, username="salon_admin", password=None):
         users = list(db.execute("SELECT id,active FROM admin_users"))
     if users:
         active = [user for user in users if user["active"]]
-        if len(active) != 1:
-            raise RuntimeError("Exactly one active administrator is required; use developer recovery")
+        if not active:
+            raise RuntimeError("An active administrator is required; use developer recovery")
         return active[0]["id"]
     if not password:
         raise RuntimeError("First launch requires SALON_ADMIN_PASSWORD (12–256 characters)")

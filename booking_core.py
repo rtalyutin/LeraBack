@@ -30,15 +30,21 @@ class BookingPermissionError(Exception):
 
 
 def migrate(db) -> None:
-    """Apply the schema and repeatable, non-destructive constructor migration."""
+    """Upgrade atomically; never replay the legacy schema over shared tables."""
+    from shared_schema import upgrade_shared
+    if db.scope:
+        raise ValueError("Migrations require an unscoped developer connection")
     try:
         db.execute("BEGIN IMMEDIATE")
-        db.execute(SCHEMA.read_text(encoding="utf-8"))
-        db.execute("ALTER TABLE services DROP CONSTRAINT IF EXISTS services_duration_minutes_check")
-        db.execute("ALTER TABLE services ADD CONSTRAINT services_duration_minutes_check CHECK (duration_minutes BETWEEN 1 AND 1440)")
-        db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES (1, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) ON CONFLICT DO NOTHING")
-        db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES (2, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) ON CONFLICT DO NOTHING")
-        db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES (3, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) ON CONFLICT DO NOTHING")
+        exists = db.execute("SELECT to_regclass('public.schema_migrations')").fetchone()[0]
+        version = db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] if exists else 0
+        if (version or 0) < 4:
+            db.execute(SCHEMA.read_text(encoding="utf-8"))
+            db.execute("ALTER TABLE services DROP CONSTRAINT IF EXISTS services_duration_minutes_check")
+            db.execute("ALTER TABLE services ADD CONSTRAINT services_duration_minutes_check CHECK (duration_minutes BETWEEN 1 AND 1440)")
+            for number in (1, 2, 3):
+                db.execute("INSERT INTO schema_migrations(version,applied_at) VALUES (?, to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')) ON CONFLICT DO NOTHING", (number,))
+            upgrade_shared(db)
         db.commit()
     except Exception:
         db.rollback()
@@ -88,7 +94,7 @@ def _replay(db, action_key: str, kind: str, fingerprint: str):
 
 def _remember(db, key, kind, fingerprint, booking_id, now):
     db.execute(
-        "INSERT INTO action_results VALUES (?,?,?,?,?)",
+        "INSERT INTO action_results(action_key,action_kind,fingerprint,booking_id,created_at) VALUES (?,?,?,?,?)",
         (key, kind, fingerprint, booking_id, stamp(now)),
     )
 
@@ -133,6 +139,11 @@ def _unblocked(db, kind, resource_id, start, end):
 def _unbooked(db, kind, resource_id, start, end, buffer_minutes, except_id=None):
     col = "master_id" if kind == "master" else "room_id"
     pad = timedelta(minutes=buffer_minutes)
+    if kind == "master":
+        return not db.execute(
+            "SELECT public.shared_master_conflict(?,?,?,?)",
+            (resource_id, stamp(start - pad), stamp(end + pad), except_id),
+        ).fetchone()[0]
     return db.execute(
         f"SELECT 1 FROM bookings WHERE {col}=? AND status='confirmed' "
         "AND id IS DISTINCT FROM ? AND start_utc<? AND end_utc>? LIMIT 1",

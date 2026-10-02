@@ -24,17 +24,18 @@ import app
 import startup
 from admin_service import create_service, snapshot
 from booking_core import connect
+from pg_store import SalonScope
 
 AUTH_SCHEMA = """
 CREATE TABLE IF NOT EXISTS admin_users (
  id INTEGER PRIMARY KEY, username TEXT UNIQUE, password_salt BLOB,
  password_hash BLOB, password_iterations INTEGER, role TEXT, active INTEGER,
  created_at TEXT, password_changed_at TEXT);
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_admin ON admin_users(active) WHERE active=1;
+CREATE TABLE IF NOT EXISTS salon_memberships (salon_id INTEGER,user_id INTEGER,role TEXT,active INTEGER,PRIMARY KEY(salon_id,user_id));
 CREATE TABLE IF NOT EXISTS admin_sessions (
  id INTEGER PRIMARY KEY, admin_user_id INTEGER, token_hash BLOB,
  created_at TEXT, last_seen_at TEXT, expires_at TEXT);
-CREATE TABLE IF NOT EXISTS admin_audit_log (
+CREATE TABLE IF NOT EXISTS account_audit_log (
  id INTEGER PRIMARY KEY, actor TEXT, action TEXT, object_type TEXT,
  object_id TEXT, details_json TEXT, created_at TEXT);
 """
@@ -89,6 +90,15 @@ class StartupAuthUnits(unittest.TestCase):
             with closing(auth_unit_connect(self.path)) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM admin_users").fetchone()[0], 0)
 
+    def test_multiple_accounts_preserve_bootstrap_and_access(self):
+        first = startup.prepare_database(self.path, "salon_admin", PASSWORD)
+        second = admin_auth.create_or_update_admin(self.path, "another_admin", PASSWORD)
+        self.assertNotEqual(first, second)
+        self.assertEqual(startup.prepare_database(self.path), first)
+        self.assertEqual(admin_auth.login(self.path, "another_admin", PASSWORD)[1].user_id, second)
+        with closing(auth_unit_connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM salon_memberships").fetchone()[0], 1)
+
     def test_disabled_administrator_needs_explicit_recovery(self):
         startup.prepare_database(self.path, "salon_admin", PASSWORD)
         with closing(auth_unit_connect(self.path)) as db:
@@ -122,8 +132,8 @@ class StartupAuthUnits(unittest.TestCase):
         self.assertEqual(successful_logins[0][1].user_id, ids[0])
         with closing(auth_unit_connect(self.path)) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM admin_users").fetchone()[0], 1)
-            self.assertEqual(db.execute("SELECT count(*) FROM admin_audit_log WHERE action='admin_created'").fetchone()[0], 1)
-            self.assertEqual(db.execute("SELECT count(*) FROM admin_audit_log WHERE action='password_changed'").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM account_audit_log WHERE action='admin_created'").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM account_audit_log WHERE action='password_changed'").fetchone()[0], 0)
 
 
 class StartupHttpUnits(unittest.TestCase):
@@ -205,19 +215,19 @@ class StartupPostgresIntegration(unittest.TestCase):
         self.assertEqual(len(successful_logins), 1)
         token, identity = successful_logins[0]
         self.assertEqual(identity.user_id, first)
-        service = create_service(URL, "Synthetic startup service", 45, "admin:test")
-        state = snapshot(URL, POLICY, date.today())
+        service = create_service(SalonScope(URL, 1), "Synthetic startup service", 45, "admin:test")
+        state = snapshot(SalonScope(URL, 1), POLICY, date.today())
         self.assertEqual(startup.prepare_database(URL, "ignored_admin", "short"), first)
         self.assertEqual(startup.prepare_database(URL), first)
         self.assertEqual(admin_auth.authenticate(URL, token).user_id, identity.user_id)
-        self.assertEqual(snapshot(URL, POLICY, date.today())["services"], state["services"])
+        self.assertEqual(snapshot(SalonScope(URL, 1), POLICY, date.today())["services"], state["services"])
         self.assertEqual(state["services"][0]["id"], service["id"])
         with closing(connect(URL)) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM admin_users").fetchone()[0], 1)
-            self.assertEqual(db.execute("SELECT count(*) FROM masters").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM public.masters WHERE salon_id=1").fetchone()[0], 0)
             self.assertEqual(dict(db.execute("SELECT * FROM admin_users").fetchone()), before)
-            self.assertEqual(db.execute("SELECT count(*) FROM admin_audit_log WHERE action='admin_created'").fetchone()[0], 1)
-            self.assertEqual(db.execute("SELECT count(*) FROM admin_audit_log WHERE action='password_changed'").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM account_audit_log WHERE action='admin_created'").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM account_audit_log WHERE action='password_changed'").fetchone()[0], 0)
             db.execute("UPDATE admin_users SET active=0")
         with self.assertRaises(RuntimeError):
             startup.prepare_database(URL, "replacement", PASSWORD)

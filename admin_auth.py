@@ -1,7 +1,7 @@
 """M6 server-side administrator authentication and sessions.
 
 The code intentionally supports only the approved-for-prototype ``admin`` role.
-    One active administrator is supported. Recovery is done by the developer's
+    Multiple administrator accounts are supported. Recovery uses the developer's
     controlled local password rotation; MFA remains a release decision.
 """
 
@@ -64,7 +64,7 @@ def create_or_update_admin(path, username: str, password: str, now=None, *, init
                 users = list(db.execute("SELECT id,active FROM admin_users"))
                 if users:
                     active = [user for user in users if user["active"]]
-                    if len(active) != 1:
+                    if not active:
                         raise ValueError("Initial setup cannot reactivate or replace administrator accounts")
                     db.commit()
                     return active[0]["id"]
@@ -79,16 +79,17 @@ def create_or_update_admin(path, username: str, password: str, now=None, *, init
                 db.execute("DELETE FROM admin_sessions WHERE admin_user_id=?", (user_id,))
                 action = "password_changed"
             else:
-                if db.execute("SELECT 1 FROM admin_users WHERE active=1 LIMIT 1").fetchone():
-                    raise ValueError("Only one active administrator is allowed")
                 user_id = db.execute(
                     "INSERT INTO admin_users(username,password_salt,password_hash,password_iterations,role,active,"
                     "created_at,password_changed_at) VALUES (?,?,?,?,'admin',1,?,?)",
                     (username, salt, digest, PBKDF2_ITERATIONS, stamp(now), stamp(now)),
                 ).lastrowid
+                # Preserve the original single-salon account's initial access.
+                if db.execute("SELECT count(*) FROM admin_users").fetchone()[0] == 1:
+                    db.execute("INSERT INTO salon_memberships(salon_id,user_id,role,active) VALUES (1,?,'admin',1) ON CONFLICT DO NOTHING", (user_id,))
                 action = "admin_created"
             db.execute(
-                "INSERT INTO admin_audit_log(actor,action,object_type,object_id,details_json,created_at) "
+                "INSERT INTO account_audit_log(actor,action,object_type,object_id,details_json,created_at) "
                 "VALUES (?,?,?,?,?,?)",
                 (f"admin:{user_id}", action, "admin_user", str(user_id), "{}", stamp(now)),
             )
@@ -128,7 +129,7 @@ def login(path, username: str, password: str, absolute_hours: int = 12, now=None
                 (row["id"], token_hash, stamp(now), stamp(now), stamp(expires)),
             ).lastrowid
             db.execute(
-                "INSERT INTO admin_audit_log(actor,action,object_type,object_id,details_json,created_at) "
+                "INSERT INTO account_audit_log(actor,action,object_type,object_id,details_json,created_at) "
                 "VALUES (?,?,?,?,?,?)",
                 (f"admin:{row['id']}", "login", "admin_session", str(session_id), "{}", stamp(now)),
             )
@@ -183,7 +184,7 @@ def logout(path, identity: AdminIdentity, now=None) -> None:
         try:
             db.execute("DELETE FROM admin_sessions WHERE id=?", (identity.session_id,))
             db.execute(
-                "INSERT INTO admin_audit_log(actor,action,object_type,object_id,details_json,created_at) "
+                "INSERT INTO account_audit_log(actor,action,object_type,object_id,details_json,created_at) "
                 "VALUES (?,?,?,?,?,?)",
                 (identity.actor, "logout", "admin_session", str(identity.session_id), "{}", stamp(now)),
             )

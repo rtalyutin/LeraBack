@@ -6,15 +6,27 @@ import os
 
 from vk_gateway import deliver_pending
 from vk_sender import VKSender
+from vk_config import integrations
+from pg_store import SalonScope, connect
+from constructor_store import get_policy
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--salon-id", type=int, required=True)
+    parser.add_argument("--group-id", type=int, required=True)
     args = parser.parse_args()
-    sender = VKSender(os.environ["VK_COMMUNITY_TOKEN"], os.environ.get("VK_API_VERSION", "5.199"),
-                      master_photo_ids=json.loads(os.environ.get("VK_MASTER_PHOTO_IDS_JSON", "{}")))
-    delivered = deliver_pending(os.environ["DATABASE_URL"], sender, limit=args.limit)
+    binding = next((b for b in integrations(os.environ) if b["salon_id"] == args.salon_id
+                    and b["group_id"] == args.group_id and b.get("token")), None)
+    if binding is None:
+        raise ValueError("No matching configured VK binding with a token")
+    scope = SalonScope(os.environ["DATABASE_URL"], args.salon_id)
+    with connect(scope) as db:
+        get_policy(db)
+    sender = VKSender(binding["token"], binding.get("api_version", "5.199"),
+                      master_photo_ids=binding.get("master_photo_ids", {}))
+    delivered = deliver_pending(scope, sender, limit=args.limit)
     print(f"Delivered: {delivered}")
 
 

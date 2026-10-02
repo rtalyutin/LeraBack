@@ -83,6 +83,7 @@ def snapshot(path, policy, local_day: date):
     zone = validate_policy(policy)
     lower, upper = _iso_day_bounds(local_day, zone)
     with closing(connect(path)) as db:
+        db.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         catalog = {
             "services": [dict(r) for r in db.execute("SELECT * FROM services ORDER BY name")],
             "masters": [dict(r) for r in db.execute("SELECT * FROM masters ORDER BY name")],
@@ -91,6 +92,10 @@ def snapshot(path, policy, local_day: date):
                 "SELECT id,master_id,room_id,weekday,start_minute,end_minute FROM work_intervals "
                 "WHERE local_date IS NULL AND mode='open' ORDER BY weekday,id")],
         }
+        for table in ("services", "masters", "rooms"):
+            for item in catalog[table]:
+                extra = db.execute(f"SELECT entity_id FROM public.{table} WHERE salon_id=public.current_salon_id() AND id=?", (item["id"],)).fetchone()
+                item["entity_id"] = extra["entity_id"]
         for kind in ("master", "room"):
             links = list(db.execute(f"SELECT {kind}_id,service_id FROM {kind}_services ORDER BY service_id"))
             for resource in catalog[f"{kind}s"]:
@@ -108,6 +113,7 @@ def snapshot(path, policy, local_day: date):
             "SELECT id,booking_id,event_kind,status,attempts,last_error,created_at FROM message_outbox "
             "WHERE status='failed' ORDER BY id DESC LIMIT 50"
         )]
+        db.commit()
         return {**catalog, "timezone": policy["timezone"], "bookings": bookings,
                 "blocks": blocks, "delivery_issues": delivery_issues}
 

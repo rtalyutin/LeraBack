@@ -52,7 +52,7 @@ class CallbackGateway:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
                 "INSERT INTO vk_dialogs(vk_id,state,draft_json,expires_at) VALUES (?,?,?,?) "
-                "ON CONFLICT(vk_id) DO UPDATE SET state=excluded.state,draft_json=excluded.draft_json,expires_at=excluded.expires_at",
+                "ON CONFLICT(salon_id,vk_id) DO UPDATE SET state=excluded.state,draft_json=excluded.draft_json,expires_at=excluded.expires_at",
                 (vk_id, state, json.dumps(draft, ensure_ascii=False), expires),
             )
             db.commit()

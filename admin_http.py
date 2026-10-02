@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import psycopg
 from collections import defaultdict, deque
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
@@ -25,6 +26,11 @@ from admin_service import (
 )
 from booking_core import BookingConflict, connect
 from ops import database_health
+from salon_service import accessible_salons, require_salon, shared_masters, attach_master
+from constructor_store import (
+    constructor_snapshot, create_type, update_type, delete_type, save_parameter,
+    delete_parameter, save_entity, archive_entity, get_policy,
+)
 
 UTC = timezone.utc
 
@@ -119,7 +125,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(
             200,
             {"username": identity.username, "role": identity.role,
-             "csrf_token": csrf_token(token, self.server.csrf_secret)},
+             "csrf_token": csrf_token(token, self.server.csrf_secret),
+             "salons": accessible_salons(self.server.db_path, identity.user_id)},
             [("Set-Cookie", self._cookie_header(token))],
         )
 
@@ -143,7 +150,10 @@ class Handler(BaseHTTPRequestHandler):
                     "username": identity.username,
                     "role": identity.role,
                     "csrf_token": csrf_token(identity.session_token, self.server.csrf_secret),
+                    "salons": accessible_salons(self.server.db_path, identity.user_id),
                 })
+            if method == "GET" and path.path == "/api/salons":
+                return self._json(200, {"salons": accessible_salons(self.server.db_path, identity.user_id)})
             if method == "POST" and not verify_csrf(
                     identity, self.server.csrf_secret, self.headers.get("X-CSRF-Token", "")):
                 return self._json(HTTPStatus.FORBIDDEN, {"error": "csrf_failed"})
@@ -151,9 +161,23 @@ class Handler(BaseHTTPRequestHandler):
                 logout(self.server.db_path, identity, now=self.server.clock())
                 return self._json(200, {"status": "logged_out"},
                                   [("Set-Cookie", self._cookie_header("", delete=True))])
+            salon_id = self.headers.get("X-Salon-Id", "")
+            if not re.fullmatch(r"[1-9][0-9]{0,17}", salon_id):
+                raise ValueError("X-Salon-Id is required")
+            scoped = require_salon(self.server.db_path, identity.user_id, int(salon_id))
+            with closing(connect(scoped)) as db:
+                policy = get_policy(db)
+            if method == "GET" and path.path == "/api/shared-masters":
+                return self._json(200, {"masters": shared_masters(scoped, identity.user_id)})
+            if method == "GET" and path.path == "/api/constructor":
+                with closing(connect(scoped)) as db:
+                    db.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    result = constructor_snapshot(db)
+                    db.commit()
+                return self._json(200, result)
             if method == "GET" and path.path == "/api/snapshot":
                 day = date.fromisoformat(parse_qs(path.query).get("date", [date.today().isoformat()])[0])
-                return self._json(200, snapshot(self.server.db_path, self.server.policy, day))
+                return self._json(200, snapshot(scoped, policy, day))
 
             body = self._body() if method == "POST" else {}
             if not isinstance(body, dict):
@@ -162,16 +186,32 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("acknowledge must be boolean")
             now = self.server.clock()
             actor = identity.actor
+            if method == "POST" and path.path == "/api/masters/attach":
+                return self._json(201, attach_master(scoped, identity.user_id,
+                    body["source_salon_id"], body["master_id"], body["service_ids"],
+                    body.get("active", True), body.get("name")))
+            constructor = re.fullmatch(r"/api/constructor/(types|parameters|entities)(?:/([1-9][0-9]*))?", path.path)
+            if method == "POST" and constructor:
+                kind, object_id = constructor[1], int(constructor[2]) if constructor[2] else None
+                with closing(connect(scoped)) as db:
+                    if kind == "types":
+                        result = (create_type(db, body["code"], body["label"], actor) if object_id is None
+                                  else update_type(db, object_id, body["label"], actor))
+                    elif kind == "parameters":
+                        result = save_parameter(db, {**body, **({"id": object_id} if object_id else {})}, actor)
+                    else:
+                        result = save_entity(db, {**body, **({"id": object_id} if object_id else {})}, actor)
+                return self._json(201 if object_id is None else 200, result)
             if method == "POST" and path.path == "/api/bookings":
                 result = create_manual_booking(
-                    self.server.db_path, self.server.policy, body["phone"], int(body["service_id"]),
+                    scoped, policy, body["phone"], int(body["service_id"]),
                     int(body["master_id"]), datetime.fromisoformat(body["start"]),
                     body.get("action_key") or secrets.token_urlsafe(16), actor, now,
                 )
                 return self._json(201, result)
             if method == "POST" and path.path == "/api/blocks":
                 result = create_block(
-                    self.server.db_path, body["resource_kind"], int(body["resource_id"]),
+                    scoped, body["resource_kind"], int(body["resource_id"]),
                     datetime.fromisoformat(body["start"]), datetime.fromisoformat(body["end"]),
                     body.get("reason", ""), actor, bool(body.get("acknowledge")), now,
                 )
@@ -182,7 +222,7 @@ class Handler(BaseHTTPRequestHandler):
                 start = body.get("start_minute")
                 end = body.get("end_minute")
                 result = update_weekly_schedule(
-                    self.server.db_path, self.server.policy, body["resource_kind"], int(body["resource_id"]),
+                    scoped, policy, body["resource_kind"], int(body["resource_id"]),
                     int(body["weekday"]), None if start is None else int(start),
                     None if end is None else int(end), actor, bool(body.get("acknowledge")), now,
                     intervals=body.get("intervals"),
@@ -191,17 +231,17 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and path.path.startswith("/api/bookings/") and path.path.endswith("/cancel"):
                 booking_id = int(path.path.split("/")[3])
                 result = cancel_admin_booking(
-                    self.server.db_path, booking_id, body.get("action_key") or secrets.token_urlsafe(16), actor, now
+                    scoped, booking_id, body.get("action_key") or secrets.token_urlsafe(16), actor, now
                 )
                 return self._json(200, result)
             if method == "POST" and path.path == "/api/services":
-                return self._json(201, create_service(self.server.db_path, body["name"],
+                return self._json(201, create_service(scoped, body["name"],
                                                       body["duration_minutes"], actor, now))
             resource = re.fullmatch(r"/api/(masters|rooms)(?:/([1-9][0-9]*))?", path.path)
             if method == "POST" and resource:
                 resource_id = int(resource[2]) if resource[2] else None
                 result = save_resource(
-                    self.server.db_path, "master" if resource[1] == "masters" else "room", resource_id,
+                    scoped, "master" if resource[1] == "masters" else "room", resource_id,
                     body["name"], body["service_ids"], body["active"], actor,
                     bool(body.get("acknowledge")), now,
                 )
@@ -209,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and re.fullmatch(r"/api/services/[1-9][0-9]*", path.path):
                 service_id = int(path.path.split("/")[3])
                 result = update_service(
-                    self.server.db_path, service_id, body["name"], body["duration_minutes"],
+                    scoped, service_id, body["name"], body["duration_minutes"],
                     body["active"], actor, bool(body.get("acknowledge")), now,
                 )
                 return self._json(200, result)
@@ -223,6 +263,10 @@ class Handler(BaseHTTPRequestHandler):
                                     "affected_booking_ids": exc.affected_booking_ids})
         except BookingConflict as exc:
             return self._json(409, {"error": "conflict", "message": str(exc), "affected_booking_ids": []})
+        except (psycopg.errors.UniqueViolation, psycopg.errors.ExclusionViolation):
+            return self._json(409, {"error": "conflict", "message": "Объект уже существует или время занято", "affected_booking_ids": []})
+        except (psycopg.errors.CheckViolation, psycopg.errors.ForeignKeyViolation, psycopg.errors.NotNullViolation):
+            return self._json(422, {"error": "invalid_request", "message": "Нарушены правила данных салона"})
         except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             return self._json(422, {"error": "invalid_request", "message": str(exc)})
         except LookupError as exc:
@@ -249,8 +293,8 @@ def server(db_path, policy, csrf_secret, host="127.0.0.1", port=8765, *, secure_
         raise RuntimeError("Unsupported bind address")
     with closing(connect(db_path)) as db:
         active = db.execute("SELECT count(*) FROM admin_users WHERE active=1").fetchone()[0]
-    if active != 1:
-        raise RuntimeError("Exactly one active administrator is required")
+    if active < 1:
+        raise RuntimeError("At least one active administrator is required")
     httpd = ThreadingHTTPServer((host, port), handler_class)
     httpd.db_path = db_path
     httpd.policy = policy

@@ -1,0 +1,30 @@
+# Disposable native PostgreSQL acceptance environment. No production credentials.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: local-synthetic-bootstrap-only
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      - ./tests/create_test_databases.sql:/docker-entrypoint-initdb.d/01-tests.sql:ro
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+  tests:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./:/app:ro
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/booking_test
+      CONSTRUCTOR_TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/constructor_test
+      STARTUP_TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/startup_test
+      SHARED_SCHEMA_TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/shared_schema_test
+      MULTISALON_TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/multisalon_test
+    command: [python, -B, -m, unittest, discover, -s, tests, -v]
