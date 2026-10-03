@@ -181,12 +181,16 @@ BEGIN
  SELECT * INTO STRICT p FROM __APP_SCHEMA__.entity_parameters
  WHERE salon_id=COALESCE(NEW.salon_id,OLD.salon_id) AND id=COALESCE(NEW.parameter_id,OLD.parameter_id) FOR SHARE;
  PERFORM 1 FROM __APP_SCHEMA__.entity_types WHERE salon_id=p.salon_id AND id=p.entity_type_id FOR UPDATE;
- SELECT * INTO STRICT e FROM __APP_SCHEMA__.entities WHERE salon_id=p.salon_id
-   AND id=COALESCE(NEW.entity_id,OLD.entity_id) FOR UPDATE;
  IF pg_trigger_depth()=1 AND p.core THEN
   RAISE EXCEPTION 'Core values are changed by their service API' USING ERRCODE='23514';
  END IF;
- IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+ IF TG_OP='DELETE' THEN
+  -- A cascading delete runs after its parent entity has been removed.
+  PERFORM 1 FROM __APP_SCHEMA__.entities WHERE salon_id=p.salon_id AND id=OLD.entity_id FOR UPDATE;
+  RETURN OLD;
+ END IF;
+ SELECT * INTO STRICT e FROM __APP_SCHEMA__.entities WHERE salon_id=p.salon_id
+   AND id=NEW.entity_id FOR UPDATE;
  IF TG_OP='UPDATE' AND (NEW.salon_id<>OLD.salon_id OR NEW.entity_id<>OLD.entity_id
     OR NEW.parameter_id<>OLD.parameter_id OR NEW.entity_type_id<>OLD.entity_type_id) THEN
   RAISE EXCEPTION 'Value identity is immutable' USING ERRCODE='23514';

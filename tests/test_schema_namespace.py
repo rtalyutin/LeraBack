@@ -190,6 +190,26 @@ class NamespacePostgres(unittest.TestCase):
         with psycopg.connect(URL, autocommit=True, cursor_factory=psycopg.ClientCursor) as raw:
             self.assertEqual(self.sentinel, self._sentinel(raw))
 
+    def test_core_value_delete_guard_and_service_cascade(self):
+        import psycopg
+        from uuid import uuid4
+        from pg_store import SalonScope, connect
+        from admin_service import create_service
+        scope = SalonScope(URL, 1)
+        result = create_service(scope, "Cascade " + uuid4().hex, 30, "admin:test")
+        with connect(scope) as db:
+            entity_id = db.execute("SELECT entity_id FROM __APP_SCHEMA__.services WHERE id=?", (result["id"],)).fetchone()[0]
+            count = db.execute("SELECT count(*) FROM __APP_SCHEMA__.entity_parameter_values WHERE entity_id=?", (entity_id,)).fetchone()[0]
+            self.assertGreater(count, 0)
+            with self.assertRaisesRegex(psycopg.errors.CheckViolation, "Core values are changed"):
+                db.execute("DELETE FROM __APP_SCHEMA__.entity_parameter_values WHERE entity_id=?", (entity_id,))
+            self.assertEqual(db.execute("SELECT count(*) FROM __APP_SCHEMA__.entity_parameter_values WHERE entity_id=?", (entity_id,)).fetchone()[0], count)
+            db.execute("DELETE FROM __APP_SCHEMA__.services WHERE id=?", (result["id"],))
+            self.assertEqual(db.execute("SELECT count(*) FROM __APP_SCHEMA__.entities WHERE id=?", (entity_id,)).fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM __APP_SCHEMA__.entity_parameter_values WHERE entity_id=?", (entity_id,)).fetchone()[0], 0)
+        with psycopg.connect(URL, autocommit=True, cursor_factory=psycopg.ClientCursor) as raw:
+            self.assertEqual(self.sentinel, self._sentinel(raw))
+
     def test_scoped_legacy_commands_constructor_and_missing_schema(self):
         from pg_store import SalonScope, connect
         from admin_service import create_service
