@@ -8,4 +8,4 @@ ENV DATABASE_SCHEMA=lera
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
   CMD ["python", "-c", "import http.client, os; c = http.client.HTTPConnection('127.0.0.1', int(os.environ.get('PORT', '8080')), timeout=5); c.request('GET', '/livez'); s = c.getresponse().status; c.close(); raise SystemExit(0 if 200 <= s < 300 else 1)"]
-CMD ["python", "-c", "import faulthandler, runpy; faulthandler.dump_traceback_later(20, repeat=False); runpy.run_path('app.py', run_name='__main__')"]
+CMD ["python", "diagnose_startup.py"]
