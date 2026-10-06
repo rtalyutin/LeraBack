@@ -32,14 +32,15 @@ class BookingPermissionError(Exception):
 def migrate(db) -> None:
     """Upgrade atomically; never replay the legacy schema over shared tables."""
     from shared_schema import upgrade_shared
+    from vk_connections import upgrade_vk
     if db.scope:
         raise ValueError("Migrations require an unscoped developer connection")
     try:
         db.execute("BEGIN IMMEDIATE")
         exists = db.execute("SELECT to_regclass('__APP_SCHEMA__.schema_migrations')").fetchone()[0]
         version = db.execute("SELECT max(version) FROM __APP_SCHEMA__.schema_migrations").fetchone()[0] if exists else 0
-        if (version or 0) > 4:
-            raise RuntimeError("Selected database schema is newer than supported version 4")
+        if (version or 0) > 5:
+            raise RuntimeError("Selected database schema is newer than supported version 5")
         if (version or 0) < 4:
             db.execute(SCHEMA.read_text(encoding="utf-8"))
             db.execute("ALTER TABLE __APP_SCHEMA__.services DROP CONSTRAINT IF EXISTS services_duration_minutes_check")
@@ -49,6 +50,7 @@ def migrate(db) -> None:
         # Version 4 has repeatable function/trigger/policy repairs. Refresh it
         # under the same transaction/lock without replaying legacy DDL/backfill.
         upgrade_shared(db)
+        upgrade_vk(db)
         db.commit()
     except Exception:
         db.rollback()

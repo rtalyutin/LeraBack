@@ -14,6 +14,8 @@ REQUIRED_TABLES = {
     "admin_users", "admin_sessions", "inbound_events", "vk_outgoing_messages",
     "accounts", "salons", "salon_memberships", "shared_masters", "shared_master_busy",
     "entity_types", "entities", "entity_parameters", "entity_parameter_values",
+    "vk_connections",
+    "salon_creation_requests",
 }
 
 
@@ -22,7 +24,7 @@ def database_health(url):
         with closing(connect(url)) as db:
             db.execute("SELECT 1").fetchone()
             version = db.execute("SELECT max(version) FROM __APP_SCHEMA__.schema_migrations").fetchone()[0]
-            if version != 4:
+            if version != 5:
                 return {"status": "error"}
         return {"status": "ok", "schema_version": version}
     except Exception:
@@ -38,8 +40,8 @@ def verify_database(url):
         if missing:
             raise ValueError(f"Missing required tables: {', '.join(sorted(missing))}")
         version = db.execute("SELECT max(version) FROM __APP_SCHEMA__.schema_migrations").fetchone()[0]
-        if version != 4:
-            raise ValueError("Database schema version 4 is required by this backend")
+        if version != 5:
+            raise ValueError("Database schema version 5 is required by this backend")
     return {"status": "ok", "schema_version": version}
 
 

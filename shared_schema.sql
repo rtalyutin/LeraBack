@@ -181,7 +181,13 @@ BEGIN
  SELECT * INTO STRICT p FROM __APP_SCHEMA__.entity_parameters
  WHERE salon_id=COALESCE(NEW.salon_id,OLD.salon_id) AND id=COALESCE(NEW.parameter_id,OLD.parameter_id) FOR SHARE;
  PERFORM 1 FROM __APP_SCHEMA__.entity_types WHERE salon_id=p.salon_id AND id=p.entity_type_id FOR UPDATE;
- IF pg_trigger_depth()=1 AND p.core THEN
+ IF pg_trigger_depth()=1 AND p.core AND NOT (
+   TG_OP='UPDATE' AND p.code='name'
+   AND COALESCE(current_setting('app.salon_profile_write',true),'')='on'
+   AND __APP_SCHEMA__.current_salon_id()=p.salon_id
+   AND EXISTS(SELECT 1 FROM __APP_SCHEMA__.entity_types
+     WHERE salon_id=p.salon_id AND id=p.entity_type_id AND code='salon_settings')
+ ) THEN
   RAISE EXCEPTION 'Core values are changed by their service API' USING ERRCODE='23514';
  END IF;
  IF TG_OP='DELETE' THEN

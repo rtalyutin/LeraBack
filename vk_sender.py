@@ -14,6 +14,11 @@ class VKSendError(RuntimeError):
     pass
 
 
+class VKCredentialSendError(VKSendError):
+    """The community token, rather than one recipient, needs attention."""
+    pass
+
+
 def vk_keyboard(buttons):
     if not buttons:
         return ""
@@ -88,6 +93,8 @@ class VKSender:
             raise VKSendError(f"VK transport failed: {type(exc).__name__}") from exc
         if "error" in payload:
             error = payload.get("error") or {}
+            if error.get("error_code") in (5, 7, 27, 28):
+                raise VKCredentialSendError("VK community credentials rejected")
             raise VKSendError(f"VK API error {error.get('error_code', 'unknown')}")
         if "response" not in payload:
             raise VKSendError("VK response has no result")
