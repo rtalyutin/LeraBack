@@ -54,14 +54,24 @@ class VKAPI:
         self._token = token
 
     @staticmethod
-    def _callback_error_param(message):
-        # Recognize only a parameter name in VK's validation-message prefix.
-        # Never copy the upstream text or a parameter value into the log.
-        if not isinstance(message, str):
+    def _callback_error_param(message, values=()):
+        # Return a fixed field name, never upstream text or a supplied value.
+        if not isinstance(message, str) or len(message) > 4096:
             return "unknown"
-        match = re.match(r"(?:One of the parameters specified was missing or invalid|Invalid parameter)"
-                         r":\s*(group_id|url|title|secret_key)(?=\s|:|$)", message, re.IGNORECASE | re.ASCII)
-        return match[1].lower() if match else "unknown"
+        for value in values:
+            if isinstance(value, str) and value:
+                message = re.sub(re.escape(value), " ", message, flags=re.IGNORECASE | re.ASCII)
+        aliases = {"group_id": r"group_id|group +id", "url": r"url|callback +url|server +address",
+                   "title": r"title", "secret_key": r"secret_key|secret +key"}
+        mentioned = [name for name, alias in aliases.items() if re.search(
+            r"(?:^|[\s:'\"(),])(?:" + alias + r")(?=$|[\s:'\"(),])", message, re.IGNORECASE | re.ASCII)]
+        # A mention alone is insufficient: "url was accepted" is not a URL rejection.
+        prefix = (r"(?:One of the parameters specified was missing or invalid:\s*(?:Invalid(?: parameter)?:?\s+)?"
+                  r"|(?:Invalid(?: parameter)?|Required parameter|Missing(?: required)? parameter):?\s+)")
+        fields = [name for name, alias in aliases.items() if re.match(
+            prefix + r"['\"]?(?:" + alias + r")(?=$|[\s:'\"(),])", message, re.IGNORECASE | re.ASCII)
+            and mentioned == [name]]
+        return fields[0] if len(fields) == 1 else "unknown"
 
     def call(self, method, **params):
         if method not in self.METHODS:
@@ -85,7 +95,8 @@ class VKAPI:
             code = code if type(code) is int and 0 <= code <= 2**31 - 1 else None
             if method == "groups.addCallbackServer" and code == 100:
                 logger.warning("VK_API_REJECTED method=%s vk_error_code=%s vk_error_param=%s", method, code,
-                               self._callback_error_param(payload["error"].get("error_msg")))
+                               self._callback_error_param(payload["error"].get("error_msg"),
+                                                          (self._token, *params.values())))
             else:
                 logger.warning("VK_API_REJECTED method=%s vk_error_code=%s", method,
                                code if code is not None else "unknown")
@@ -130,6 +141,11 @@ def callback_origin(value, request_origin, secure=True):
     except ValueError:
         raise VKSetupError("invalid_origin", "Некорректный адрес сайта.") from None
     return value
+
+
+def new_callback_secret():
+    """Use a conservative ASCII alphanumeric alphabet, within VK's 50-char limit."""
+    return secrets.token_hex(24)
 
 
 def upgrade_vk(db):
@@ -282,7 +298,7 @@ class VKConnections:
                 row = self._row(db, scope.salon_id)
             row["group_id"] = group_id
             old = self._open(row) if row["credentials_ciphertext"] else {}
-            credentials = {"token": token.strip(), "secret": old.get("secret") or secrets.token_urlsafe(32),
+            credentials = {"token": token.strip(), "secret": old.get("secret") or new_callback_secret(),
                            "confirmation": confirmation["code"]}
             encrypted = self._seal(row, credentials)
             if new_binding:
@@ -358,9 +374,17 @@ class VKConnections:
         elif row["creation_ambiguous"]:
             raise VKSetupError("callback_uncertain", "ВК не подтвердил создание сервера. Повторите проверку позже; если он не появится, обратитесь к разработчику.")
         else:
+            # Only replace an incompatible secret when readback permits a new create.
+            # Existing or uncertain remote servers must retain their original secret.
+            ciphertext = row["credentials_ciphertext"]
+            if not isinstance(credentials.get("secret"), str) or not re.fullmatch(
+                    r"[A-Za-z0-9]{1,50}", credentials["secret"], re.ASCII):
+                credentials = {**credentials, "secret": new_callback_secret()}
+                ciphertext = self._seal(row, credentials)
             # Persist uncertainty BEFORE request. A crash/timeout must never cause a blind second create.
-            db.execute("UPDATE __APP_SCHEMA__.vk_connections SET creation_ambiguous=true,step='callback' WHERE salon_id=?",
-                       (row["salon_id"],))
+            # Confirmation reads the same persisted secret using another DB connection.
+            db.execute("UPDATE __APP_SCHEMA__.vk_connections SET credentials_ciphertext=?,"
+                       "creation_ambiguous=true,step='callback' WHERE salon_id=?", (ciphertext, row["salon_id"]))
             try:
                 created = api.call("groups.addCallbackServer", group_id=row["group_id"], url=self._url(row),
                                    title=self._title(row), secret_key=credentials["secret"])

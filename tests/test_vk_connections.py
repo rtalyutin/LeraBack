@@ -2,13 +2,14 @@
 import json
 import io
 import os
+import re
 import threading
 import unittest
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from cryptography.fernet import Fernet
 from pg_store import SalonScope, connect
@@ -16,7 +17,7 @@ from booking_core import migrate
 from admin_auth import create_or_update_admin
 from salon_service import create_salon, accessible_salons, salon_profile, update_salon, require_salon
 from constructor_store import constructor_snapshot
-from vk_connections import VKAPI, VKConnections, VKSetupError, VKTransportError, community_reference, callback_origin
+from vk_connections import VKAPI, VKConnections, VKSetupError, VKTransportError, community_reference, callback_origin, new_callback_secret
 
 URL = os.environ.get("VK_CONNECTION_TEST_DATABASE_URL", "")
 TOKEN = "synthetic-community-key-1234567890"
@@ -63,6 +64,12 @@ class Inputs(unittest.TestCase):
         cases = [("One of the parameters specified was missing or invalid: " + name + " is invalid: " + TOKEN, name)
                  for name in ("group_id", "url", "title", "secret_key")]
         cases += [("Invalid parameter: SECRET_KEY " + TOKEN, "secret_key"),
+                  ("One of the parameters specified was missing or invalid: Invalid secret key", "secret_key"),
+                  ("Required parameter 'url' is missing", "url"),
+                  ("Invalid group id", "group_id"),
+                  ("Invalid server address", "url"),
+                  ("Invalid secret_key or title", "unknown"),
+                  ("Invalid access_token; url was accepted", "unknown"),
                   ("One of the parameters specified was missing or invalid", "unknown"),
                   ("One of the parameters specified was missing or invalid: access_token " + TOKEN, "unknown"),
                   ("One of the parameters specified was missing or invalid: secret_key_extra " + TOKEN, "unknown"),
@@ -97,6 +104,19 @@ class Inputs(unittest.TestCase):
                             VKAPI(TOKEN).call(method)
                 self.assertNotIn("vk_error_param=", logged.output[0])
                 self.assertNotIn(TOKEN, logged.output[0])
+
+    def test_parameter_names_inside_supplied_values_do_not_become_diagnostic_fields(self):
+        value = "synthetic private secret key with url and title"
+        for message in ("Invalid value: " + value, "Invalid value: " + value.upper(), "Invalid " + value.upper()):
+            with self.subTest(message=message):
+                with patch("vk_connections.build_opener") as opener:
+                    opener.return_value.open.return_value = io.BytesIO(json.dumps({"error": {
+                        "error_code": 100, "error_msg": message}}).encode())
+                    with self.assertLogs("vk_connections", level="WARNING") as logged:
+                        with self.assertRaises(VKSetupError):
+                            VKAPI(value).call("groups.addCallbackServer", secret_key=value)
+                self.assertIn("vk_error_param=unknown", logged.output[0])
+                self.assertNotIn(value, logged.output[0])
 
     def test_successful_vk_call_keeps_response_and_emits_no_rejection(self):
         with patch("vk_connections.build_opener") as opener:
@@ -190,6 +210,125 @@ class FakeVK:
                 raise VKTransportError()
             self.servers = [s for s in self.servers if s["id"] != params["server_id"]]
         return 1
+
+
+class CallbackSecretLifecycle(unittest.TestCase):
+    def prepare(self, secret, *, check_only=False, ambiguous=False):
+        service = VKConnections("unused", Fernet.generate_key())
+        credentials = {"token": TOKEN, "secret": secret, "confirmation": "synthetic-confirmation"}
+        row = {"salon_id": 1, "connection_id": "a" * 32, "group_id": 123,
+               "callback_origin": ORIGIN, "check_only": check_only, "creation_ambiguous": ambiguous}
+        row["credentials_ciphertext"] = service._seal(row, credentials)
+        stored = {"ciphertext": row["credentials_ciphertext"], "ambiguous": ambiguous}
+        db, api = Mock(), FakeVK()
+
+        def observe_write(statement, params=()):
+            if "credentials_ciphertext=?" in statement:
+                stored["ciphertext"] = params[0]
+            if "creation_ambiguous=true" in statement:
+                stored["ambiguous"] = True
+            if "creation_ambiguous=false" in statement:
+                stored["ambiguous"] = False
+            return Mock()
+
+        db.execute.side_effect = observe_write
+        original_call = api.call
+
+        def observe_create(method, **params):
+            if method == "groups.addCallbackServer":
+                # Credential snapshot seen by a separate confirmation reader.
+                saved = service._open({**row, "credentials_ciphertext": stored["ciphertext"]})
+                self.assertEqual(saved["secret"], params["secret_key"])
+                self.assertTrue(stored["ambiguous"])
+            return original_call(method, **params)
+
+        api.call = observe_create
+        return service, row, credentials, stored, db, api
+
+    def test_new_secrets_fit_the_conservative_alphabet_and_vk_length_limit(self):
+        for _ in range(64):
+            secret = new_callback_secret()
+            self.assertEqual(len(secret), 48)
+            self.assertRegex(secret, r"\A[a-f0-9]{48}\Z")
+
+    def test_new_creation_persists_replacement_before_vk_and_preserves_valid_secret(self):
+        for secret in ("legacy-secret_with-symbols", "validSecret0123456789", "x" * 51):
+            with self.subTest(secret=secret):
+                service, row, credentials, stored, db, api = self.prepare(secret)
+                service._configure(db, row, api, credentials)
+                saved = service._open({**row, "credentials_ciphertext": stored["ciphertext"]})
+                self.assertRegex(saved["secret"], r"\A[A-Za-z0-9]{1,50}\Z")
+                if re.fullmatch(r"[A-Za-z0-9]{1,50}", secret):
+                    self.assertEqual(saved["secret"], secret)
+                else:
+                    self.assertNotEqual(saved["secret"], secret)
+                self.assertEqual(sum(m == "groups.addCallbackServer" for m, _ in api.calls), 1)
+
+    def test_remote_ownership_and_safety_guards_preserve_legacy_secret(self):
+        for scenario in ("owned", "recovered_owned", "conflict", "duplicates", "check_only", "ambiguous"):
+            with self.subTest(scenario=scenario):
+                service, row, credentials, stored, db, api = self.prepare(
+                    "legacy-secret_with-symbols", check_only=scenario == "check_only", ambiguous=scenario in ("ambiguous", "recovered_owned"))
+                server = {"id": 10, "title": service._title(row), "url": service._url(row),
+                          "secret_key": credentials["secret"], "status": "ok"}
+                if scenario in ("owned", "recovered_owned", "conflict", "duplicates"):
+                    api.servers = [server]
+                if scenario == "conflict":
+                    api.servers[0] = {**server, "secret_key": "different"}
+                if scenario == "duplicates":
+                    api.servers.append({**server, "id": 11})
+                if scenario in ("owned", "recovered_owned"):
+                    service._configure(db, row, api, credentials)
+                else:
+                    with self.assertRaises(VKSetupError):
+                        service._configure(db, row, api, credentials)
+                self.assertEqual(stored["ciphertext"], row["credentials_ciphertext"])
+                self.assertFalse(any(m == "groups.addCallbackServer" for m, _ in api.calls))
+
+    def test_timeout_readback_keeps_replacement_and_never_creates_a_duplicate(self):
+        for remote_created in (False, True):
+            with self.subTest(remote_created=remote_created):
+                service, row, credentials, stored, db, api = self.prepare("legacy-secret_with-symbols")
+                api.fail_create_after_commit = remote_created
+                api.fail_create_without_commit = not remote_created
+                with self.assertRaises(VKSetupError) as caught:
+                    service._configure(db, row, api, credentials)
+                self.assertEqual(caught.exception.code, "callback_uncertain")
+                self.assertTrue(stored["ambiguous"])
+                snapshot = {**row, "credentials_ciphertext": stored["ciphertext"], "creation_ambiguous": True}
+                replacement = service._open(snapshot)
+                self.assertNotEqual(replacement["secret"], credentials["secret"])
+                if remote_created:
+                    service._configure(db, snapshot, api, replacement)
+                else:
+                    with self.assertRaises(VKSetupError) as caught:
+                        service._configure(db, snapshot, api, replacement)
+                    self.assertEqual(caught.exception.code, "callback_uncertain")
+                self.assertEqual(stored["ciphertext"], snapshot["credentials_ciphertext"])
+                self.assertEqual(sum(m == "groups.addCallbackServer" for m, _ in api.calls), 1)
+
+    def test_explicit_rejection_allows_retry_with_the_same_replacement(self):
+        service, row, credentials, stored, db, api = self.prepare("legacy-secret_with-symbols")
+        original_call, attempts = api.call, []
+
+        def reject_once(method, **params):
+            if method == "groups.addCallbackServer":
+                attempts.append(params["secret_key"])
+                if len(attempts) == 1:
+                    saved = service._open({**row, "credentials_ciphertext": stored["ciphertext"]})
+                    self.assertEqual(saved["secret"], params["secret_key"])
+                    raise VKSetupError("vk_rejected", "Synthetic explicit rejection", 502)
+            return original_call(method, **params)
+
+        api.call = reject_once
+        with self.assertRaises(VKSetupError):
+            service._configure(db, row, api, credentials)
+        self.assertFalse(stored["ambiguous"])
+        snapshot = {**row, "credentials_ciphertext": stored["ciphertext"], "creation_ambiguous": False}
+        service._configure(db, snapshot, api, service._open(snapshot))
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(stored["ciphertext"], snapshot["credentials_ciphertext"])
 
 
 @unittest.skipUnless(URL, "VK_CONNECTION_TEST_DATABASE_URL absent; PostgreSQL not executed")
