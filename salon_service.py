@@ -2,6 +2,9 @@
 
 from contextlib import closing
 from datetime import datetime, timezone
+import json
+import re
+from pathlib import Path
 
 from admin_auth import AuthorizationError
 from admin_service import _admin_audit, _catalog_name, _unique_name
@@ -22,6 +25,85 @@ def require_salon(url, user_id, salon_id):
     if not any(row["id"] == salon_id for row in accessible_salons(url, user_id)):
         raise AuthorizationError("Salon access denied")
     return SalonScope(url, salon_id)
+
+
+def _salon_name(value):
+    if not isinstance(value, str) or not 1 <= len(value.strip()) <= 200:
+        raise ValueError("Название салона должно содержать от 1 до 200 символов")
+    return value.strip()
+
+
+def create_salon(url, user_id, name, action_key):
+    """Authenticated onboarding: never accept account/membership IDs from the browser."""
+    from shared_schema import provision_salon
+    name = _salon_name(name)
+    if not isinstance(action_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,100}", action_key):
+        raise ValueError("Требуется ключ операции создания салона")
+    with connect(url) as db:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            account = db.execute("SELECT id FROM accounts WHERE id=? AND active=1 AND role='admin' FOR UPDATE", (user_id,)).fetchone()
+            if not account:
+                raise AuthorizationError("Active administrator required")
+            previous = db.execute("SELECT salon_id,requested_name FROM salon_creation_requests WHERE user_id=? AND action_key=?",
+                                  (user_id, action_key)).fetchone()
+            if previous:
+                if previous["requested_name"] != name:
+                    raise ValueError("Этот ключ уже использован для другого названия салона")
+                salon_id = previous["salon_id"]
+                if not db.execute("SELECT 1 FROM salon_memberships WHERE user_id=? AND salon_id=? AND active=1",
+                                  (user_id, salon_id)).fetchone():
+                    raise AuthorizationError("Salon access denied")
+            else:
+                policy = json.loads(Path(__file__).with_name("starter_data.json").read_text())["policy"]
+                salon_id = provision_salon(db, name, policy)
+                grant_membership(db, user_id, salon_id)
+                db.execute("INSERT INTO salon_creation_requests(user_id,action_key,salon_id,requested_name) VALUES (?,?,?,?)",
+                           (user_id, action_key, salon_id, name))
+                db.execute("INSERT INTO account_audit_log(actor,action,object_type,object_id,details_json,created_at) VALUES (?,?,?,?,?,?)",
+                           (f"admin:{user_id}", "salon_created", "salon", str(salon_id), "{}", datetime.now(timezone.utc).isoformat()))
+            row = db.execute("SELECT id,name FROM salons WHERE id=? AND active=1", (salon_id,)).fetchone()
+            if row is None:
+                raise AuthorizationError("Salon access denied")
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+    return {**dict(row), "role": "admin", "salons": accessible_salons(url, user_id)}
+
+
+def salon_profile(scope):
+    with connect(scope) as db:
+        row = db.execute("SELECT id,name FROM salons WHERE id=? AND active=1", (scope.salon_id,)).fetchone()
+        if row is None:
+            raise LookupError("Салон не найден")
+        return dict(row)
+
+
+def update_salon(scope, user_id, name):
+    name = _salon_name(name)
+    with connect(scope) as db:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            if not db.execute("SELECT 1 FROM salon_memberships m JOIN accounts a ON a.id=m.user_id "
+                              "JOIN salons s ON s.id=m.salon_id WHERE m.salon_id=? AND m.user_id=? "
+                              "AND m.active=1 AND a.active=1 AND s.active=1 FOR UPDATE OF m,a,s",
+                              (scope.salon_id, user_id)).fetchone():
+                raise AuthorizationError("Salon access denied")
+            # Name is canonical constructor data; its existing trigger maintains the registry.
+            db.execute("SELECT set_config('app.salon_profile_write','on',true)")
+            db.execute("UPDATE __APP_SCHEMA__.entity_parameter_values v SET value_string=? "
+                       "FROM __APP_SCHEMA__.entity_parameters p JOIN __APP_SCHEMA__.entity_types t "
+                       "ON t.salon_id=p.salon_id AND t.id=p.entity_type_id "
+                       "WHERE v.salon_id=? AND p.salon_id=v.salon_id AND p.id=v.parameter_id "
+                       "AND p.code='name' AND t.code='salon_settings'", (name, scope.salon_id))
+            _admin_audit(db, f"admin:{user_id}", "salon_updated", "salon", scope.salon_id, {}, datetime.now(timezone.utc))
+            row = db.execute("SELECT id,name FROM salons WHERE id=?", (scope.salon_id,)).fetchone()
+            db.commit()
+            return dict(row)
+        except Exception:
+            db.rollback()
+            raise
 
 
 def shared_masters(scope, user_id):

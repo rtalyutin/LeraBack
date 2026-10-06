@@ -265,7 +265,8 @@ def deliver_pending(db_path, sender, limit=50, now=None):
             try:
                 row = db.execute(
                     "SELECT * FROM vk_outgoing_messages WHERE status IN ('pending','failed') "
-                    "AND id>? ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED", (after_id,)
+                    "AND id>? ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END,attempts,id "
+                    "LIMIT 1 FOR UPDATE SKIP LOCKED", (after_id,)
                 ).fetchone()
                 if row is None:
                     db.commit()

@@ -174,7 +174,7 @@ class NamespacePostgres(unittest.TestCase):
         from pg_store import connect
         from ops import database_health, verify_database
         with connect(URL) as db:
-            self.assertEqual(db.execute("SELECT max(version) FROM __APP_SCHEMA__.schema_migrations").fetchone()[0], 4)
+            self.assertEqual(db.execute("SELECT max(version) FROM __APP_SCHEMA__.schema_migrations").fetchone()[0], 5)
             migrate(db)
             self.assertEqual(db.execute("SELECT current_schema()").fetchone()[0], "lera")
             wrong_fks = db.execute("""SELECT c.conname FROM pg_catalog.pg_constraint c
@@ -185,8 +185,8 @@ class NamespacePostgres(unittest.TestCase):
             paths = db.execute("SELECT p.proconfig FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=?", ("lera",)).fetchall()
             self.assertTrue(paths)
             self.assertTrue(all("public" not in str(p[0]) for p in paths))
-        self.assertEqual(database_health(URL), {"status": "ok", "schema_version": 4})
-        self.assertEqual(verify_database(URL), {"status": "ok", "schema_version": 4})
+        self.assertEqual(database_health(URL), {"status": "ok", "schema_version": 5})
+        self.assertEqual(verify_database(URL), {"status": "ok", "schema_version": 5})
         with psycopg.connect(URL, autocommit=True, cursor_factory=psycopg.ClientCursor) as raw:
             self.assertEqual(self.sentinel, self._sentinel(raw))
 
@@ -323,7 +323,7 @@ class NamespacePostgres(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT max(version) FROM __APP_SCHEMA__.schema_migrations").fetchone()[0], 9999)
                 self.assertEqual(db.execute("SELECT pg_get_functiondef('__APP_SCHEMA__.projection_entity_before()'::regprocedure)").fetchone()[0], definition)
                 self.assertEqual(database_health(URL), {"status": "error"})
-                with self.assertRaisesRegex(ValueError, "version 4"):
+                with self.assertRaisesRegex(ValueError, "version 5"):
                     verify_database(URL)
             finally:
                 db.execute("DELETE FROM __APP_SCHEMA__.schema_migrations WHERE version=9999")

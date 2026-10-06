@@ -121,5 +121,5 @@ class ConstructorIntegration(unittest.TestCase):
                 migrate(migration_db)
             after = [dict(r) for r in db.execute("SELECT * FROM services ORDER BY id")]
             self.assertEqual(before, after)
-            self.assertEqual(db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0], 4)
+            self.assertEqual(db.execute("SELECT max(version) FROM schema_migrations").fetchone()[0], 5)
         update_service(URL, sid, "Длинный приём "+uuid4().hex, 150, True, self.actor)

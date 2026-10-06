@@ -26,11 +26,13 @@ from admin_service import (
 )
 from booking_core import BookingConflict, connect
 from ops import database_health
-from salon_service import accessible_salons, require_salon, shared_masters, attach_master
+from salon_service import (accessible_salons, require_salon, shared_masters, attach_master,
+                           create_salon, salon_profile, update_salon)
 from constructor_store import (
     constructor_snapshot, create_type, update_type, delete_type, save_parameter,
     delete_parameter, save_entity, archive_entity, get_policy,
 )
+from vk_connections import VKSetupError
 
 UTC = timezone.utc
 
@@ -161,10 +163,23 @@ class Handler(BaseHTTPRequestHandler):
                 logout(self.server.db_path, identity, now=self.server.clock())
                 return self._json(200, {"status": "logged_out"},
                                   [("Set-Cookie", self._cookie_header("", delete=True))])
+            if method == "POST" and path.path == "/api/salons":
+                body = self._body()
+                if not isinstance(body, dict):
+                    raise ValueError("JSON object required")
+                return self._json(201, create_salon(self.server.db_path, identity.user_id,
+                                                  body.get("name"), body.get("action_key")))
             salon_id = self.headers.get("X-Salon-Id", "")
             if not re.fullmatch(r"[1-9][0-9]{0,17}", salon_id):
                 raise ValueError("X-Salon-Id is required")
             scoped = require_salon(self.server.db_path, identity.user_id, int(salon_id))
+            if method == "GET" and path.path == "/api/salon":
+                return self._json(200, salon_profile(scoped))
+            if path.path == "/api/vk" and method == "GET":
+                service = getattr(self.server, "vk_service", None)
+                if service is None:
+                    raise VKSetupError("vk_unavailable", "Подключение ВК пока не включено. Обратитесь к разработчику.", 503)
+                return self._json(200, service.status(scoped))
             with closing(connect(scoped)) as db:
                 policy = get_policy(db)
             if method == "GET" and path.path == "/api/shared-masters":
@@ -182,6 +197,19 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body() if method == "POST" else {}
             if not isinstance(body, dict):
                 raise ValueError("JSON object required")
+            if method == "POST" and path.path == "/api/salon":
+                return self._json(200, update_salon(scoped, identity.user_id, body.get("name")))
+            if method == "POST" and path.path in ("/api/vk/connect", "/api/vk/retry", "/api/vk/check", "/api/vk/disconnect"):
+                service = getattr(self.server, "vk_service", None)
+                if service is None:
+                    raise VKSetupError("vk_unavailable", "Подключение ВК пока не включено. Обратитесь к разработчику.", 503)
+                if path.path == "/api/vk/connect":
+                    result = service.connect(scoped, body, self.headers.get("Origin", ""), self.server.secure_cookie, user_id=identity.user_id)
+                elif path.path == "/api/vk/disconnect":
+                    return self._json(200, service.disconnect(scoped, user_id=identity.user_id))
+                else:
+                    result = service.retry(scoped, check_only=path.path == "/api/vk/check", user_id=identity.user_id)
+                return self._json(202, result)
             if "acknowledge" in body and type(body["acknowledge"]) is not bool:
                 raise ValueError("acknowledge must be boolean")
             now = self.server.clock()
@@ -254,6 +282,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self._json(200, result)
             return self._json(404, {"error": "not_found"})
+        except VKSetupError as exc:
+            return self._json(exc.status, {"error": exc.code, "message": exc.message})
         except AuthenticationError:
             return self._json(HTTPStatus.UNAUTHORIZED, {"error": "authentication_required"})
         except AuthorizationError:
