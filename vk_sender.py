@@ -23,13 +23,20 @@ def vk_keyboard(buttons):
     if not buttons:
         return ""
     rows = []
+    previous_row = None
     for item in buttons:
         action = {
             "type": "text",
             "label": str(item["label"])[:40],
             "payload": json.dumps(item.get("payload", {}), ensure_ascii=False, separators=(",", ":")),
         }
-        rows.append([{"action": action, "color": "primary"}])
+        row = item.get("row")
+        entry = {"action": action, "color": "primary"}
+        if type(row) is int and row == previous_row and rows:
+            rows[-1].append(entry)
+        else:
+            rows.append([entry])
+        previous_row = row if type(row) is int else None
     return json.dumps({"inline": True, "buttons": rows}, ensure_ascii=False, separators=(",", ":"))
 
 

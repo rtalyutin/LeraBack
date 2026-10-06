@@ -6,15 +6,17 @@ import hashlib
 import hmac
 import json
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
 from booking_core import (
     BookingConflict, _check_phone, cancel_booking, confirm_booking, connect,
-    get_available_slots, reschedule_booking, stamp, validate_policy,
+    get_available_days, get_available_slots, reschedule_booking, stamp, validate_policy,
 )
 
 UTC = timezone.utc
+CALENDAR_PAGE_SIZE = 8
+WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 
 
 def button(label, command, value=None, draft=None):
@@ -65,6 +67,77 @@ class CallbackGateway:
     def _home():
         return "Что хотите сделать?", [button("Записаться", "book"), button("Мои записи", "my")], None
 
+    @staticmethod
+    def _page(value, total):
+        # Treat button payloads as untrusted; never use negative slices or bools.
+        page = value if type(value) is int else 0
+        return max(0, min(page, max(0, (total - 1) // CALENDAR_PAGE_SIZE)))
+
+    @staticmethod
+    def _calendar_choices(items, page, command, page_command, draft_id):
+        choices = []
+        start = page * CALENDAR_PAGE_SIZE
+        for index, (label, value) in enumerate(items[start:start + CALENDAR_PAGE_SIZE]):
+            choices.append(dict(button(label, command, value, draft_id), row=index // 2))
+        nav_row = (len(choices) + 1) // 2
+        if page:
+            choices.append(dict(button("Раньше", page_command, page - 1, draft_id), row=nav_row))
+        if start + CALENDAR_PAGE_SIZE < len(items):
+            choices.append(dict(button("Позже", page_command, page + 1, draft_id), row=nav_row))
+        return choices, nav_row + 1
+
+    def _show_days(self, vk_id, draft, now, *, reschedule=False, page=0, note=None):
+        with closing(connect(self.db_path)) as db:
+            days = get_available_days(db, self.policy, draft["service_id"], draft["master_id"], now,
+                                      except_id=draft.get("booking_id") if reschedule else None)
+        page = self._page(page, len(days))
+        for key in ("local_date", "start_utc", "offered_slots", "time_page"):
+            draft.pop(key, None)
+        # A new view invalidates buttons for an earlier selection, including
+        # confirmation. Keep this ID stable from choosing a slot through its
+        # atomic confirmation/replay; rotate only when rebuilding the calendar.
+        draft["id"] = uuid4().hex
+        draft["date_page"] = page
+        draft["offered_days"] = days[page * CALENDAR_PAGE_SIZE:(page + 1) * CALENDAR_PAGE_SIZE]
+        self._save(vk_id, "reschedule_date" if reschedule else "date", draft)
+        if not days:
+            text = "В доступном периоде записи свободных дней нет."
+            choices = [button("Проверить снова", "days", 0, draft["id"]), button("В меню", "home")]
+        else:
+            items = []
+            for value in days:
+                day = date.fromisoformat(value)
+                items.append((f"{WEEKDAYS[day.weekday()]}, {day:%d.%m}", value))
+            choices, row = self._calendar_choices(items, page, "day", "days", draft["id"])
+            choices.append(dict(button("В меню", "home"), row=row))
+            text = "Выберите свободный день"
+            if len(days) > CALENDAR_PAGE_SIZE:
+                text += f" · страница {page + 1}/{(len(days) - 1) // CALENDAR_PAGE_SIZE + 1}"
+        return (note + "\n" if note else "") + text, choices, None
+
+    def _show_times(self, vk_id, draft, local_day, now, *, reschedule=False, page=0, note=None):
+        with closing(connect(self.db_path)) as db:
+            slots = get_available_slots(db, self.policy, draft["service_id"], draft["master_id"], local_day, now,
+                                       except_id=draft.get("booking_id") if reschedule else None)
+        if not slots:
+            return self._show_days(vk_id, draft, now, reschedule=reschedule,
+                                   page=draft.get("date_page", 0),
+                                   note=note or "На выбранный день свободного времени уже нет.")
+        page = self._page(page, len(slots))
+        draft.pop("start_utc", None)
+        draft["id"] = uuid4().hex
+        draft.update(local_date=local_day.isoformat(), time_page=page,
+                     offered_slots=slots[page * CALENDAR_PAGE_SIZE:(page + 1) * CALENDAR_PAGE_SIZE])
+        self._save(vk_id, "reschedule_time" if reschedule else "time", draft)
+        items = [(datetime.fromisoformat(slot.replace("Z", "+00:00")).astimezone(self.zone).strftime("%H:%M"), slot)
+                 for slot in slots]
+        choices, row = self._calendar_choices(items, page, "time", "times", draft["id"])
+        choices.append(dict(button("Другой день", "days", draft.get("date_page", 0), draft["id"]), row=row))
+        text = f"Выберите время на {local_day:%d.%m.%Y}"
+        if len(slots) > CALENDAR_PAGE_SIZE:
+            text += f" · страница {page + 1}/{(len(slots) - 1) // CALENDAR_PAGE_SIZE + 1}"
+        return (note + "\n" if note else "") + text, choices, None
+
     def _process(self, vk_id, text, payload, now):
         state, draft = self._load(vk_id)
         command = payload.get("cmd") if isinstance(payload, dict) else None
@@ -111,25 +184,39 @@ class CallbackGateway:
             if not rows:
                 raise BookingConflict("Мастер больше недоступен")
             draft.update(master_id=int(value), master_name=rows[0]["name"])
-            self._save(vk_id, "date", draft)
-            return "Напишите дату в формате ДД.ММ.ГГГГ", [], None
-        if state in {"date", "reschedule_date"} and not command:
+            return self._show_days(vk_id, draft, now)
+        calendar_states = {"date", "time", "phone", "confirm", "reschedule_date", "reschedule_time", "reschedule_confirm"}
+        reschedule = state.startswith("reschedule")
+        if command == "days" and state in calendar_states:
+            return self._show_days(vk_id, draft, now, reschedule=reschedule, page=value)
+        if command == "times" and state in {"time", "reschedule_time"}:
+            if "local_date" not in draft:
+                return self._show_days(vk_id, draft, now, reschedule=reschedule)
+            return self._show_times(vk_id, draft, date.fromisoformat(draft["local_date"]), now,
+                                    reschedule=reschedule, page=value)
+        if state in {"date", "reschedule_date"} and (command == "day" or not command):
             try:
-                local_day = datetime.strptime(text.strip(), "%d.%m.%Y").date()
-            except ValueError:
-                return "Не понял дату. Например: 30.09.2026", [], None
-            with closing(connect(self.db_path)) as db:
-                slots = get_available_slots(db, self.policy, draft["service_id"], draft["master_id"], local_day, now)
-            if not slots:
-                return "На эту дату свободного времени нет.", [], None
-            next_state = "reschedule_time" if state == "reschedule_date" else "time"
-            self._save(vk_id, next_state, draft)
-            choices = []
-            for slot in slots[:12]:
-                local = datetime.fromisoformat(slot.replace("Z", "+00:00")).astimezone(self.zone)
-                choices.append(button(local.strftime("%H:%M"), "time", slot, draft["id"]))
-            return "Выберите время", choices, None
+                if command == "day":
+                    if not isinstance(value, str) or value not in draft.get("offered_days", []):
+                        raise ValueError("Date button not offered")
+                    local_day = date.fromisoformat(value)
+                else:
+                    local_day = datetime.strptime(text.strip(), "%d.%m.%Y").date()
+            except (TypeError, ValueError):
+                return self._show_days(vk_id, draft, now, reschedule=reschedule,
+                                       page=draft.get("date_page", 0), note="Выберите день актуальной кнопкой.")
+            return self._show_times(vk_id, draft, local_day, now, reschedule=reschedule)
         if command == "time" and state in {"time", "reschedule_time"}:
+            if "local_date" not in draft:
+                return self._show_days(vk_id, draft, now, reschedule=reschedule,
+                                       note="Выберите свободный день.")
+            local_day = date.fromisoformat(draft["local_date"])
+            with closing(connect(self.db_path)) as db:
+                slots = get_available_slots(db, self.policy, draft["service_id"], draft["master_id"], local_day, now,
+                                           except_id=draft.get("booking_id") if reschedule else None)
+            if not isinstance(value, str) or value not in draft.get("offered_slots", []) or value not in slots:
+                return self._show_times(vk_id, draft, local_day, now, reschedule=reschedule,
+                                        page=draft.get("time_page", 0), note="Это время уже недоступно. Выберите другое.")
             draft["start_utc"] = str(value)
             if state == "reschedule_time":
                 self._save(vk_id, "reschedule_confirm", draft)
@@ -144,10 +231,15 @@ class CallbackGateway:
             summary = f"Проверьте: {draft['service_name']}, {draft['master_name']}, {local:%d.%m %H:%M}, {draft['phone']}"
             return summary, [button("Подтвердить", "confirm", draft=draft["id"])], None
         if command == "confirm" and state == "confirm":
-            booking = confirm_booking(
-                self.db_path, self.policy, vk_id, draft["phone"], draft["service_id"], draft["master_id"],
-                datetime.fromisoformat(draft["start_utc"].replace("Z", "+00:00")), f"vk-confirm:{draft['id']}", now,
-            )
+            try:
+                booking = confirm_booking(
+                    self.db_path, self.policy, vk_id, draft["phone"], draft["service_id"], draft["master_id"],
+                    datetime.fromisoformat(draft["start_utc"].replace("Z", "+00:00")), f"vk-confirm:{draft['id']}", now,
+                )
+            except BookingConflict:
+                local_day = datetime.fromisoformat(draft["start_utc"].replace("Z", "+00:00")).astimezone(self.zone).date()
+                return self._show_times(vk_id, draft, local_day, now,
+                                        note="Не удалось записаться на это время. Выберите другое окно.")
             self._save(vk_id, "home", {})
             return "Запись подтверждена и сохранена в календаре.", [button("Мои записи", "my")], booking["id"]
         if command == "my" or normalized == "мои записи":
@@ -183,13 +275,17 @@ class CallbackGateway:
                 raise BookingConflict("Запись недоступна")
             draft.update(booking_id=int(value), service_id=rows[0]["service_id"], master_id=rows[0]["master_id"],
                          service_name=rows[0]["service_name_snapshot"], master_name=rows[0]["master_name_snapshot"])
-            self._save(vk_id, "reschedule_date", draft)
-            return "Напишите новую дату в формате ДД.ММ.ГГГГ", [], None
+            return self._show_days(vk_id, draft, now, reschedule=True)
         if command == "reschedule_confirm" and state == "reschedule_confirm":
-            booking = reschedule_booking(
-                self.db_path, self.policy, vk_id, draft["booking_id"],
-                datetime.fromisoformat(draft["start_utc"].replace("Z", "+00:00")), f"vk-reschedule:{draft['id']}", now,
-            )
+            try:
+                booking = reschedule_booking(
+                    self.db_path, self.policy, vk_id, draft["booking_id"],
+                    datetime.fromisoformat(draft["start_utc"].replace("Z", "+00:00")), f"vk-reschedule:{draft['id']}", now,
+                )
+            except BookingConflict:
+                local_day = datetime.fromisoformat(draft["start_utc"].replace("Z", "+00:00")).astimezone(self.zone).date()
+                return self._show_times(vk_id, draft, local_day, now, reschedule=True,
+                                        note="Не удалось перенести запись на это время. Выберите другое окно.")
             self._save(vk_id, "home", {})
             return "Запись перенесена. Старое время освобождено.", [button("Мои записи", "my")], booking["id"]
         return self._home()

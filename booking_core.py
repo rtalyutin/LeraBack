@@ -210,13 +210,12 @@ def _candidate(db, policy, service_id, master_id, start, now, except_id=None, cl
     raise BookingConflict("No suitable room")
 
 
-def get_available_slots(db, policy, service_id, master_id, local_day: date, now: datetime,
-                        *, weekly_overlay=None):
+def _available_slots(db, policy, service_id, master_id, local_day: date, now: datetime,
+                     *, weekly_overlay=None, except_id=None):
     zone = validate_policy(policy)
     if now.tzinfo is None:
         raise ValueError("Timezone-aware now required")
     step = policy["slot_step_minutes"]
-    result = []
     for minute in range(0, 1440, step):
         wall = datetime(local_day.year, local_day.month, local_day.day, minute // 60, minute % 60)
         for fold in (0, 1):
@@ -227,10 +226,36 @@ def get_available_slots(db, policy, service_id, master_id, local_day: date, now:
                 continue
             start = candidate.astimezone(UTC)
             try:
-                _candidate(db, policy, service_id, master_id, start, now, weekly_overlay=weekly_overlay)
+                _candidate(db, policy, service_id, master_id, start, now,
+                           weekly_overlay=weekly_overlay, except_id=except_id)
             except BookingConflict:
                 continue
-            result.append(stamp(start))
+            yield stamp(start)
+
+
+def get_available_slots(db, policy, service_id, master_id, local_day: date, now: datetime,
+                        *, weekly_overlay=None, except_id=None):
+    return list(_available_slots(db, policy, service_id, master_id, local_day, now,
+                                 weekly_overlay=weekly_overlay, except_id=except_id))
+
+
+def get_available_days(db, policy, service_id, master_id, now: datetime, *, except_id=None):
+    """Return salon-local dates with at least one bookable appointment.
+
+    Stop after the first free slot on each day; final booking still checks
+    availability atomically. Reuse the exact slot rules, including DST.
+    """
+    zone = validate_policy(policy)
+    if now.tzinfo is None:
+        raise ValueError("Timezone-aware now required")
+    today = now.astimezone(zone).date()
+    first = 0 if policy["same_day_allowed"] else 1
+    result = []
+    for offset in range(first, policy["booking_horizon_days"] + 1):
+        day = today + timedelta(days=offset)
+        if next(_available_slots(db, policy, service_id, master_id, day, now,
+                                 except_id=except_id), None) is not None:
+            result.append(day.isoformat())
     return result
 
 
