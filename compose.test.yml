@@ -26,6 +26,7 @@ services:
       DATABASE_SCHEMA: public
       TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/booking_test
       CONSTRUCTOR_TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/constructor_test
+      CONSTRUCTOR_UX_TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/constructor_ux_test
       STARTUP_TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/startup_test
       SHARED_SCHEMA_TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/shared_schema_test
       MULTISALON_TEST_DATABASE_URL: postgresql://lera_test:local-synthetic-only@postgres/multisalon_test

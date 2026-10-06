@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 
 from booking_core import (
     BookingConflict, _candidate, _check_phone, _fingerprint, _remember, _replay, _working,
-    connect, parse, stamp, validate_policy,
+    connect, get_available_slots, parse, stamp, validate_policy,
 )
 from vk_gateway import stable_random_id
 
@@ -406,3 +407,172 @@ def update_weekly_schedule(path, policy, resource_kind, resource_id, weekday,
         except Exception:
             db.rollback()
             raise
+
+
+def _positive_id(value):
+    if type(value) is not int or not 0 < value < 9223372036854775807:
+        raise ValueError("Идентификатор должен быть положительным целым числом")
+    return value
+
+
+def normalize_weekly_draft(resource_kind, resource_id, days):
+    """Validate all selected days before either previewing or persisting them."""
+    if not isinstance(resource_kind, str) or resource_kind not in {"master", "room"}:
+        raise ValueError("Выберите мастера или кабинет")
+    _positive_id(resource_id)
+    if not isinstance(days, list) or not 1 <= len(days) <= 7:
+        raise ValueError("Выберите от одного до семи дней недели")
+    normalized = []
+    seen = set()
+    for day in days:
+        if not isinstance(day, dict):
+            raise ValueError("День недели должен быть объектом")
+        weekday = day.get("weekday")
+        if type(weekday) is not int or not 0 <= weekday <= 6:
+            raise ValueError("День недели должен быть числом от 0 до 6")
+        if weekday in seen:
+            raise ValueError("Один день недели нельзя передать дважды")
+        seen.add(weekday)
+        intervals = day.get("intervals")
+        if not isinstance(intervals, list):
+            raise ValueError("Рабочие интервалы должны быть списком")
+        opening = []
+        for interval in intervals:
+            if not isinstance(interval, dict):
+                raise ValueError("Рабочий интервал должен быть объектом")
+            a, b = interval.get("start_minute"), interval.get("end_minute")
+            if type(a) is not int or type(b) is not int or not 0 <= a < b <= 1440:
+                raise ValueError("Начало должно быть раньше конца в пределах одного дня")
+            opening.append((a, b))
+        merged = []
+        for a, b in sorted(opening):
+            if merged and a < merged[-1][1]:
+                raise ValueError("Рабочие интервалы не должны пересекаться")
+            if merged and a == merged[-1][1]:
+                merged[-1] = (merged[-1][0], b)
+            else:
+                merged.append((a, b))
+        normalized.append({"weekday": weekday, "intervals": [
+            {"start_minute": a, "end_minute": b} for a, b in merged]})
+    return sorted(normalized, key=lambda day: day["weekday"])
+
+
+def _weekly_overlay(resource_kind, resource_id, days):
+    return {(resource_kind, resource_id, day["weekday"]): [
+        (interval["start_minute"], interval["end_minute"]) for interval in day["intervals"]]
+        for day in days}
+
+
+def _require_resource(db, resource_kind, resource_id):
+    # The connection's scoped view checks both existence and salon ownership.
+    if not db.execute(f"SELECT 1 FROM {resource_kind}s WHERE id=?", (resource_id,)).fetchone():
+        raise LookupError("Мастер или кабинет не найден в выбранном салоне")
+
+
+def update_weekly_schedule_batch(path, policy, resource_kind, resource_id, days, actor, now=None):
+    """Atomically replace selected days, preserving every confirmed booking.
+
+    Unlike the legacy single-day endpoint, this command never cancels bookings.
+    An impact conflict is always returned before any schedule writes.
+    """
+    now = now or datetime.now(UTC)
+    zone = validate_policy(policy)
+    if not actor or now.tzinfo is None:
+        raise ValueError("actor and timezone-aware now required")
+    days = normalize_weekly_draft(resource_kind, resource_id, days)
+    overlay = _weekly_overlay(resource_kind, resource_id, days)
+    column = f"{resource_kind}_id"
+    selected = {day["weekday"] for day in days}
+    with closing(connect(path)) as db:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            _require_resource(db, resource_kind, resource_id)
+            upcoming = db.execute(
+                f"SELECT id,start_utc,end_utc FROM bookings WHERE {column}=? "
+                "AND status='confirmed' AND end_utc>? ORDER BY id",
+                (resource_id, stamp(now)),
+            ).fetchall()
+            affected = [row["id"] for row in upcoming
+                        if parse(row["start_utc"]).astimezone(zone).weekday() in selected
+                        and not _working(db, resource_kind, resource_id, parse(row["start_utc"]),
+                                         parse(row["end_utc"]), zone, overlay)]
+            if affected:
+                raise AdminConflict("Новый график затрагивает действующие записи. Перенесите записи перед изменением графика.", affected)
+            for day in days:
+                db.execute(f"DELETE FROM work_intervals WHERE {column}=? AND weekday=? "
+                           "AND local_date IS NULL AND mode='open'", (resource_id, day["weekday"]))
+                db.executemany(
+                    f"INSERT INTO work_intervals({column},weekday,mode,start_minute,end_minute) "
+                    "VALUES (?,?,'open',?,?)",
+                    [(resource_id, day["weekday"], item["start_minute"], item["end_minute"])
+                     for item in day["intervals"]])
+            _admin_audit(db, actor, "weekly_schedule_batch_updated", resource_kind, resource_id,
+                         {"days": days}, now)
+            db.commit()
+            return {"resource_kind": resource_kind, "resource_id": resource_id, "days": days,
+                    "cancelled_booking_ids": [], "manual_contact_booking_ids": []}
+        except Exception:
+            db.rollback()
+            raise
+
+
+def availability_preview(path, policy, service_id, master_id, local_date, now, draft=None, *, drafts=None):
+    """Read-only real booking availability with optional in-memory drafts."""
+    zone = validate_policy(policy)
+    _positive_id(service_id)
+    _positive_id(master_id)
+    if not isinstance(local_date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", local_date):
+        raise ValueError("Дата должна быть в формате YYYY-MM-DD")
+    local_day = date.fromisoformat(local_date)
+    if now.tzinfo is None:
+        raise ValueError("Timezone-aware now required")
+    if draft is not None and drafts is not None:
+        raise ValueError("Передайте draft или drafts, но не оба поля")
+    if drafts is not None and (not isinstance(drafts, list) or len(drafts) > 100):
+        raise ValueError("Черновики должны быть списком не более чем из 100 ресурсов")
+    requested_drafts = drafts if drafts is not None else ([] if draft is None else [draft])
+    overlay = {}
+    resources = set()
+    for item in requested_drafts:
+        if not isinstance(item, dict):
+            raise ValueError("Черновик расписания должен быть объектом")
+        kind, resource_id = item.get("resource_kind"), item.get("resource_id")
+        days = normalize_weekly_draft(kind, resource_id, item.get("days"))
+        candidate = _weekly_overlay(kind, resource_id, days)
+        if overlay.keys() & candidate.keys():
+            raise ValueError("Черновик одного ресурса и дня нельзя передать дважды")
+        overlay.update(candidate)
+        resources.add((kind, resource_id))
+    with closing(connect(path)) as db:
+        db.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        try:
+            for table, object_id in (("services", service_id), ("masters", master_id)):
+                if not db.execute(f"SELECT 1 FROM {table} WHERE id=?", (object_id,)).fetchone():
+                    raise LookupError("Услуга или мастер не найдены в выбранном салоне")
+            for kind, resource_id in resources:
+                _require_resource(db, kind, resource_id)
+            slots = get_available_slots(db, policy, service_id, master_id, local_day, now,
+                                        weekly_overlay=overlay)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+    constraints = [
+        "Учтены графики мастера и подходящих кабинетов, перерывы, блокировки и действующие записи.",
+        "Услуга и мастер должны быть активны; эта услуга должна быть доступна у мастера и хотя бы в одном активном кабинете.",
+        f"Горизонт записи: {policy['booking_horizon_days']} дней; минимальное время до записи: {policy['min_notice_minutes']} мин.",
+        f"Шаг времени: {policy['slot_step_minutes']} мин; интервал между записями: {policy['buffer_minutes']} мин.",
+    ]
+    if not policy["same_day_allowed"]:
+        constraints.append("Запись на текущий день отключена.")
+    days_ahead = (local_day - now.astimezone(zone).date()).days
+    empty_message = None
+    if not slots:
+        if days_ahead < 0 or days_ahead > policy["booking_horizon_days"]:
+            empty_message = "Выбранная дата за пределами доступного периода записи."
+        elif days_ahead == 0 and not policy["same_day_allowed"]:
+            empty_message = "Запись на текущий день отключена правилами салона."
+        else:
+            empty_message = "На выбранную дату доступных окон нет с учётом графиков, связей услуг, блокировок, записей и правил салона."
+    return {"slots": slots, "timezone": policy["timezone"], "date": local_date,
+            "draft_applied": bool(overlay), "constraints": constraints, "empty_message": empty_message}

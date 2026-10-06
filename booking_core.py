@@ -105,7 +105,7 @@ def _remember(db, key, kind, fingerprint, booking_id, now):
     )
 
 
-def _intervals(db, kind, resource_id, local_day):
+def _intervals(db, kind, resource_id, local_day, weekly_overlay=None):
     col = "master_id" if kind == "master" else "room_id"
     args = (resource_id, local_day.isoformat(), local_day.weekday())
     rows = db.execute(
@@ -114,11 +114,16 @@ def _intervals(db, kind, resource_id, local_day):
     ).fetchall()
     dated_opens = [(r["start_minute"], r["end_minute"]) for r in rows if r["mode"] == "open" and r["local_date"] is not None]
     weekly_opens = [(r["start_minute"], r["end_minute"]) for r in rows if r["mode"] == "open" and r["local_date"] is None]
+    # A validated constructor draft replaces only the selected weekly openings.
+    # Dated exceptions and saved closed intervals retain their normal precedence.
+    key = (kind, resource_id, local_day.weekday())
+    if weekly_overlay is not None and key in weekly_overlay:
+        weekly_opens = weekly_overlay[key]
     closed = [(r["start_minute"], r["end_minute"]) for r in rows if r["mode"] == "closed"]
     return dated_opens if dated_opens else weekly_opens, closed
 
 
-def _working(db, kind, resource_id, start, end, zone):
+def _working(db, kind, resource_id, start, end, zone, weekly_overlay=None):
     first, last = start.astimezone(zone), end.astimezone(zone)
     ends_at_midnight = (
         last.date() == first.date() + timedelta(days=1)
@@ -130,7 +135,7 @@ def _working(db, kind, resource_id, start, end, zone):
     b = 1440 if ends_at_midnight else last.hour * 60 + last.minute
     if last.second or last.microsecond:
         b += 1
-    opens, closed = _intervals(db, kind, resource_id, first.date())
+    opens, closed = _intervals(db, kind, resource_id, first.date(), weekly_overlay)
     return any(lo <= a and b <= hi for lo, hi in opens) and not any(lo < b and hi > a for lo, hi in closed)
 
 
@@ -157,7 +162,8 @@ def _unbooked(db, kind, resource_id, start, end, buffer_minutes, except_id=None)
     ).fetchone() is None
 
 
-def _candidate(db, policy, service_id, master_id, start, now, except_id=None, client_id=None, client_phone=None):
+def _candidate(db, policy, service_id, master_id, start, now, except_id=None, client_id=None, client_phone=None,
+               *, weekly_overlay=None):
     zone = validate_policy(policy)
     now = now.astimezone(UTC)
     local_start = start.astimezone(zone)
@@ -181,7 +187,7 @@ def _candidate(db, policy, service_id, master_id, start, now, except_id=None, cl
     if row is None:
         raise BookingConflict("Service or master unavailable")
     end = start + timedelta(minutes=row["duration_minutes"])
-    if not _working(db, "master", master_id, start, end, zone) or not _unblocked(db, "master", master_id, start, end):
+    if not _working(db, "master", master_id, start, end, zone, weekly_overlay) or not _unblocked(db, "master", master_id, start, end):
         raise BookingConflict("Master outside schedule or blocked")
     if not _unbooked(db, "master", master_id, start, end, policy["buffer_minutes"], except_id):
         raise BookingConflict("Master occupied")
@@ -199,12 +205,13 @@ def _candidate(db, policy, service_id, master_id, start, now, except_id=None, cl
         "WHERE rs.service_id=? AND r.active=1 ORDER BY r.id", (service_id,)
     ):
         room_id = room["id"]
-        if _working(db, "room", room_id, start, end, zone) and _unblocked(db, "room", room_id, start, end) and _unbooked(db, "room", room_id, start, end, policy["buffer_minutes"], except_id):
+        if _working(db, "room", room_id, start, end, zone, weekly_overlay) and _unblocked(db, "room", room_id, start, end) and _unbooked(db, "room", room_id, start, end, policy["buffer_minutes"], except_id):
             return room_id, end, row
     raise BookingConflict("No suitable room")
 
 
-def get_available_slots(db, policy, service_id, master_id, local_day: date, now: datetime):
+def get_available_slots(db, policy, service_id, master_id, local_day: date, now: datetime,
+                        *, weekly_overlay=None):
     zone = validate_policy(policy)
     if now.tzinfo is None:
         raise ValueError("Timezone-aware now required")
@@ -220,7 +227,7 @@ def get_available_slots(db, policy, service_id, master_id, local_day: date, now:
                 continue
             start = candidate.astimezone(UTC)
             try:
-                _candidate(db, policy, service_id, master_id, start, now)
+                _candidate(db, policy, service_id, master_id, start, now, weekly_overlay=weekly_overlay)
             except BookingConflict:
                 continue
             result.append(stamp(start))
