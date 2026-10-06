@@ -5,7 +5,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
-COPY *.py *.sql starter_data.json ./
+COPY *.py *.sql starter_data.json schema_contract.json ./
 ENV PYTHONUNBUFFERED=1
 ENV DATABASE_SCHEMA=lera
 EXPOSE 8080

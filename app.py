@@ -93,7 +93,8 @@ def main():
     except (ValueError, TypeError) as exc:
         raise RuntimeError("Invalid VK integration configuration") from exc
     prepare_database(database_url, os.environ.get("SALON_ADMIN_USERNAME", "salon_admin"),
-                     os.environ.pop("SALON_ADMIN_PASSWORD", None))
+                     os.environ.pop("SALON_ADMIN_PASSWORD", None),
+                     mode=os.environ.get("DATABASE_STARTUP_MODE", "auto"))
     vk_service = VKConnections(database_url, os.environ.get("VK_TOKEN_ENCRYPTION_KEY"))
     print("Database initialized; administrator ready", flush=True)
     gateways = {}

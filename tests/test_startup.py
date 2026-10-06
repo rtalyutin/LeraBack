@@ -150,7 +150,7 @@ class StartupHttpUnits(unittest.TestCase):
                     patch.object(app, "server", return_value=httpd) as create_server, \
                     patch("builtins.print"):
                 app.main()
-                prepare.assert_called_once_with(env["DATABASE_URL"], "salon_admin", password)
+                prepare.assert_called_once_with(env["DATABASE_URL"], "salon_admin", password, mode="auto")
                 self.assertNotIn("SALON_ADMIN_PASSWORD", os.environ)
                 args = create_server.call_args
                 self.assertEqual(args.args, (env["DATABASE_URL"], POLICY, None))

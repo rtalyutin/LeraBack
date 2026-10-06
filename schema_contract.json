@@ -1,0 +1,22 @@
+{
+  "format": 1,
+  "schema_version": 5,
+  "sources": {
+    "schema_postgres.sql": "7284caa065a952da9e6d048028290c68dba45c04e577e7dacf9323fa80abeee1",
+    "shared_schema.sql": "478cff5875d79ac5ef8877373355f902395790d195bd66cbc585d4196fc20ac0",
+    "shared_schema.py": "f02045b9e95d6998f60aa440cad815cd18e2c155c486672e4c8dac75e22f9da5",
+    "booking_core.py:migrate": "9673e13be2321e4c48d36366397c2411e0cc509ea349e79c371a00ca2827140f",
+    "vk_connections.py:upgrade_vk": "bfe53a4c80e99aeea76d125ac8f28929e1977562cba8f4225b4c8d453f521d39"
+  },
+  "catalog": {
+    "relations": "dcc905b64acee6a0e3b099c29135b578dc34f4a6ed8f3101795344ada45e9208",
+    "columns": "58afc9a1eea2a78bf5ed76370d003156475ab369dc624b5de5ed652629ca9b35",
+    "constraints": "28ce79dc719ae38c2bbeabb5afdbf775beb6d4a530c818ec216ac150c782d436",
+    "indexes": "bd3cc9d10377cd915a9e8a8f94ff69c4a4a89a3fc18e23af45f7461c14e5eb3e",
+    "functions": "830b74f78b4a5992bd0850d41ff5ef8b2874a4cae7cad49fecf332e66bd0b7ab",
+    "triggers": "59fc8bc239d74aaa1d7a5ff48e06076bd419d7ebe7748417db5f94883a03d36a",
+    "policies": "0d7fae8907ff6ce950022b931bc0a4062da0faef4dfcdf155cb82bcfad3a410e",
+    "internal_triggers": "36177ad83871168ec9f1a3e29fa92c54d18ea45f01325af47950dc24fd4173a4",
+    "sequences": "dd89386ceb0d0aca6d3b5b22313175a58488b9102280804df66157fd1d9ebb67"
+  }
+}
