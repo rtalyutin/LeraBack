@@ -16,7 +16,7 @@ from booking_core import migrate
 from admin_auth import create_or_update_admin
 from salon_service import create_salon, accessible_salons, salon_profile, update_salon, require_salon
 from constructor_store import constructor_snapshot
-from vk_connections import VKConnections, VKSetupError, VKTransportError, community_reference, callback_origin
+from vk_connections import VKAPI, VKConnections, VKSetupError, VKTransportError, community_reference, callback_origin
 
 URL = os.environ.get("VK_CONNECTION_TEST_DATABASE_URL", "")
 TOKEN = "synthetic-community-key-1234567890"
@@ -24,6 +24,47 @@ ORIGIN = "https://salon.example"
 
 
 class Inputs(unittest.TestCase):
+    def test_vk_rejections_log_method_and_numeric_code_without_upstream_secrets(self):
+        cases = [(5, "vk_permissions", 422), (6, "vk_rate_limit", 502),
+                 (100, "vk_rejected", 502), (2000, "vk_rejected", 502)]
+        for upstream_code, public_code, status in cases:
+            with self.subTest(code=upstream_code):
+                payload = {"error": {"error_code": upstream_code, "error_msg": TOKEN,
+                                     "request_params": [{"key": "access_token", "value": TOKEN}]}}
+                with patch("vk_connections.build_opener") as opener:
+                    opener.return_value.open.return_value = io.BytesIO(json.dumps(payload).encode())
+                    with self.assertLogs("vk_connections", level="WARNING") as logged:
+                        with self.assertRaises(VKSetupError) as caught:
+                            VKAPI(TOKEN).call("groups.addCallbackServer", secret_key="synthetic-private-secret")
+                self.assertEqual((caught.exception.code, caught.exception.status), (public_code, status))
+                output = "\n".join(logged.output)
+                self.assertIn("method=groups.addCallbackServer", output)
+                self.assertIn(f"vk_error_code={upstream_code}", output)
+                for secret in (TOKEN, "synthetic-private-secret", "request_params", "access_token"):
+                    self.assertNotIn(secret, output)
+                    self.assertNotIn(secret, str(caught.exception))
+                if public_code == "vk_rejected":
+                    self.assertNotIn("права", caught.exception.message.lower())
+
+    def test_malformed_vk_error_code_is_not_logged_verbatim(self):
+        for upstream_code in (TOKEN, {"token": TOKEN}, [TOKEN], True, 5.0, -1, 2**31):
+            with self.subTest(code=upstream_code):
+                with patch("vk_connections.build_opener") as opener:
+                    opener.return_value.open.return_value = io.BytesIO(json.dumps({
+                        "error": {"error_code": upstream_code, "error_msg": TOKEN}}).encode())
+                    with self.assertLogs("vk_connections", level="WARNING") as logged:
+                        with self.assertRaises(VKSetupError) as caught:
+                            VKAPI(TOKEN).call("groups.setSettings", group_id=123)
+                self.assertEqual(caught.exception.code, "vk_rejected")
+                self.assertIn("vk_error_code=unknown", logged.output[0])
+                self.assertNotIn(TOKEN, "\n".join(logged.output))
+
+    def test_successful_vk_call_keeps_response_and_emits_no_rejection(self):
+        with patch("vk_connections.build_opener") as opener:
+            opener.return_value.open.return_value = io.BytesIO(b'{"response":{"server_id":10}}')
+            with self.assertNoLogs("vk_connections", level="WARNING"):
+                self.assertEqual(VKAPI(TOKEN).call("groups.addCallbackServer"), {"server_id": 10})
+
     def test_credential_errors_are_distinct_from_recipient_errors(self):
         from vk_sender import VKSender, VKSendError, VKCredentialSendError
         def response(code):

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -25,6 +26,7 @@ from pg_store import SalonScope, connect
 API_VERSION = "5.199"
 LOCK_BASE = 810000000000000000
 STATUSES = {"disconnected", "configuring", "connected", "needs_attention"}
+logger = logging.getLogger(__name__)
 
 
 class VKSetupError(Exception):
@@ -68,11 +70,16 @@ class VKAPI:
             raise VKTransportError()
         if "error" in payload:
             code = payload["error"].get("error_code") if isinstance(payload["error"], dict) else None
+            # Keep the causal signal without logging upstream text, request params or credentials.
+            # A malformed error_code can itself contain a token, so only accept a real integer.
+            code = code if type(code) is int and 0 <= code <= 2**31 - 1 else None
+            logger.warning("VK_API_REJECTED method=%s vk_error_code=%s", method,
+                           code if code is not None else "unknown")
             if code in (5, 7, 15, 27, 28, 203):
                 raise VKSetupError("vk_permissions", "Проверьте ключ этого сообщества и права: управление сообществом и сообщения.")
             if code == 6:
                 raise VKSetupError("vk_rate_limit", "ВК временно ограничил запросы. Повторите позже.", 502)
-            raise VKSetupError("vk_rejected", "ВК отклонил настройку. Проверьте права ключа и повторите.", 502)
+            raise VKSetupError("vk_rejected", "ВК отклонил настройку. Обратитесь к разработчику для проверки причины отказа.", 502)
         if "response" not in payload:
             raise VKTransportError()
         return payload["response"]
