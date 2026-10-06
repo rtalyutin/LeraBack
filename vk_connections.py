@@ -53,6 +53,16 @@ class VKAPI:
     def __init__(self, token):
         self._token = token
 
+    @staticmethod
+    def _callback_error_param(message):
+        # Recognize only a parameter name in VK's validation-message prefix.
+        # Never copy the upstream text or a parameter value into the log.
+        if not isinstance(message, str):
+            return "unknown"
+        match = re.match(r"(?:One of the parameters specified was missing or invalid|Invalid parameter)"
+                         r":\s*(group_id|url|title|secret_key)(?=\s|:|$)", message, re.IGNORECASE | re.ASCII)
+        return match[1].lower() if match else "unknown"
+
     def call(self, method, **params):
         if method not in self.METHODS:
             raise ValueError("Unsupported VK method")
@@ -73,8 +83,12 @@ class VKAPI:
             # Keep the causal signal without logging upstream text, request params or credentials.
             # A malformed error_code can itself contain a token, so only accept a real integer.
             code = code if type(code) is int and 0 <= code <= 2**31 - 1 else None
-            logger.warning("VK_API_REJECTED method=%s vk_error_code=%s", method,
-                           code if code is not None else "unknown")
+            if method == "groups.addCallbackServer" and code == 100:
+                logger.warning("VK_API_REJECTED method=%s vk_error_code=%s vk_error_param=%s", method, code,
+                               self._callback_error_param(payload["error"].get("error_msg")))
+            else:
+                logger.warning("VK_API_REJECTED method=%s vk_error_code=%s", method,
+                               code if code is not None else "unknown")
             if code in (5, 7, 15, 27, 28, 203):
                 raise VKSetupError("vk_permissions", "Проверьте ключ этого сообщества и права: управление сообществом и сообщения.")
             if code == 6:

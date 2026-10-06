@@ -59,6 +59,45 @@ class Inputs(unittest.TestCase):
                 self.assertIn("vk_error_code=unknown", logged.output[0])
                 self.assertNotIn(TOKEN, "\n".join(logged.output))
 
+    def test_callback_parameter_rejection_logs_only_known_parameter_name(self):
+        cases = [("One of the parameters specified was missing or invalid: " + name + " is invalid: " + TOKEN, name)
+                 for name in ("group_id", "url", "title", "secret_key")]
+        cases += [("Invalid parameter: SECRET_KEY " + TOKEN, "secret_key"),
+                  ("One of the parameters specified was missing or invalid", "unknown"),
+                  ("One of the parameters specified was missing or invalid: access_token " + TOKEN, "unknown"),
+                  ("One of the parameters specified was missing or invalid: secret_key_extra " + TOKEN, "unknown"),
+                  ("Invalid parameter: secret_key-extra " + TOKEN, "unknown"),
+                  ("Invalid parameter: t\u0131tle " + TOKEN, "unknown"),
+                  ("Invalid parameter: url\u044f " + TOKEN, "unknown"),
+                  ("url=" + ORIGIN + " title=" + TOKEN, "unknown"),
+                  (TOKEN, "unknown"), (None, "unknown"), ({"secret_key": TOKEN}, "unknown")]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                payload = {"error": {"error_code": 100, "error_msg": message,
+                                     "request_params": [{"key": "secret_key", "value": TOKEN}]}}
+                with patch("vk_connections.build_opener") as opener:
+                    opener.return_value.open.return_value = io.BytesIO(json.dumps(payload).encode())
+                    with self.assertLogs("vk_connections", level="WARNING") as logged:
+                        with self.assertRaises(VKSetupError) as caught:
+                            VKAPI(TOKEN).call("groups.addCallbackServer", secret_key=TOKEN, url=ORIGIN, title=TOKEN)
+                self.assertEqual((caught.exception.code, caught.exception.status), ("vk_rejected", 502))
+                self.assertEqual(logged.output, ["WARNING:vk_connections:VK_API_REJECTED "
+                    "method=groups.addCallbackServer vk_error_code=100 vk_error_param=" + expected])
+                self.assertNotIn(TOKEN, str(caught.exception))
+                self.assertNotIn(ORIGIN, str(caught.exception))
+
+    def test_callback_parameter_detail_is_scoped_to_create_validation_error(self):
+        for method, code in (("groups.addCallbackServer", 7), ("groups.setSettings", 100)):
+            with self.subTest(method=method, code=code):
+                with patch("vk_connections.build_opener") as opener:
+                    opener.return_value.open.return_value = io.BytesIO(json.dumps({"error": {
+                        "error_code": code, "error_msg": "Invalid parameter: secret_key " + TOKEN}}).encode())
+                    with self.assertLogs("vk_connections", level="WARNING") as logged:
+                        with self.assertRaises(VKSetupError):
+                            VKAPI(TOKEN).call(method)
+                self.assertNotIn("vk_error_param=", logged.output[0])
+                self.assertNotIn(TOKEN, logged.output[0])
+
     def test_successful_vk_call_keeps_response_and_emits_no_rejection(self):
         with patch("vk_connections.build_opener") as opener:
             opener.return_value.open.return_value = io.BytesIO(b'{"response":{"server_id":10}}')
