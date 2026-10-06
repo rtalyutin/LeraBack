@@ -22,7 +22,8 @@ from admin_auth import (
 )
 from admin_service import (
     AdminConflict, cancel_admin_booking, create_block, create_manual_booking, create_service,
-    save_resource, snapshot, update_service, update_weekly_schedule,
+    availability_preview, save_resource, snapshot, update_service, update_weekly_schedule,
+    update_weekly_schedule_batch,
 )
 from booking_core import BookingConflict, connect
 from ops import database_health
@@ -214,6 +215,13 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("acknowledge must be boolean")
             now = self.server.clock()
             actor = identity.actor
+            if method == "POST" and path.path == "/api/availability-preview":
+                return self._json(200, availability_preview(
+                    scoped, policy, body["service_id"], body["master_id"], body["date"], now,
+                    draft=body.get("draft"), drafts=body.get("drafts")))
+            if method == "POST" and path.path == "/api/weekly-schedule/batch":
+                return self._json(200, update_weekly_schedule_batch(
+                    scoped, policy, body["resource_kind"], body["resource_id"], body["days"], actor, now))
             if method == "POST" and path.path == "/api/masters/attach":
                 return self._json(201, attach_master(scoped, identity.user_id,
                     body["source_salon_id"], body["master_id"], body["service_ids"],
