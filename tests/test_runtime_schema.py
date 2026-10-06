@@ -4,11 +4,13 @@ RUNTIME_SCHEMA_TEST_DATABASE_URL must point to a fresh, isolated schema owned by
 a NOSUPERUSER NOBYPASSRLS test role. Production URLs must never be supplied.
 """
 from contextlib import closing
+import json
 import os
 import unittest
 from unittest.mock import MagicMock, patch
 
 import startup
+import schema_runtime
 from pg_store import connect
 from schema_runtime import _normalize
 
@@ -100,6 +102,58 @@ class NamespaceFingerprintUnits(unittest.TestCase):
         self.assertEqual(normalized, "SELECT __APP_SCHEMA__.entities, __APP_SCHEMA__.entities, lera_extra.entities, 'lera', 'two  spaces';")
 
 
+class PrivilegeDiagnosticsUnits(unittest.TestCase):
+    def test_reports_all_known_missing_operations_without_echoing_unknown_data(self):
+        db = MagicMock(schema_name="lera")
+        def query(sql, params=()):
+            result = MagicMock()
+            result.fetchone.return_value = (True,)
+            if "jsonb_to_recordset" in sql:
+                result.__iter__.return_value = iter([
+                    {"relation": "services", "privilege": "INSERT"},
+                    {"relation": "accounts", "privilege": "UPDATE"},
+                    {"relation": "SYNTHETIC_SECRET", "privilege": "DELETE"}])
+            elif "pg_depend" in sql:
+                result.__iter__.return_value = iter([
+                    {"relation": "shared_masters"}, {"relation": "SYNTHETIC_SECRET"}])
+            elif "to_regprocedure" in sql:
+                result.fetchone.return_value = (False,)
+            return result
+        db.execute.side_effect = query
+        issues = schema_runtime.runtime_privilege_issues(db)
+        self.assertIn("services INSERT", issues)
+        self.assertIn("accounts UPDATE", issues)
+        self.assertIn("shared_masters sequence USAGE or UPDATE", issues)
+        self.assertIn("current_salon_id() EXECUTE", issues)
+        self.assertIn("shared_master_conflict(bigint,text,text,bigint) EXECUTE", issues)
+        self.assertNotIn("SYNTHETIC_SECRET", str(issues))
+
+    def test_privilege_and_multiple_schema_failures_are_reported_together_read_only(self):
+        expected = json.loads(schema_runtime.CONTRACT.read_text())
+        fingerprints = dict(expected["catalog"], relations="synthetic-drift", functions="synthetic-drift")
+        db = MagicMock(schema_name="lera")
+        def query(sql, params=()):
+            result = MagicMock()
+            result.fetchone.return_value = None
+            if "rolsuper,rolbypassrls" in sql:
+                result.fetchone.return_value = {"rolsuper": False, "rolbypassrls": False}
+            return result
+        db.execute.side_effect = query
+        with patch.object(schema_runtime, "schema_version", return_value=5), \
+                patch.object(schema_runtime, "runtime_privilege_issues", return_value=["services INSERT"]), \
+                patch.object(schema_runtime, "catalog_fingerprints", return_value=fingerprints):
+            with self.assertRaises(RuntimeError) as error:
+                schema_runtime.verify_runtime_schema(db)
+        self.assertIn("services INSERT", str(error.exception))
+        self.assertIn("Database schema contract mismatch: relations, functions", str(error.exception))
+        db.rollback.assert_called_once()
+        db.commit.assert_not_called()
+        self.assertEqual(db.execute.call_args_list[0].args[0],
+                         "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        self.assertTrue(all(call.args[0].startswith(("SELECT", "BEGIN ISOLATION"))
+                            for call in db.execute.call_args_list))
+
+
 URL = os.environ.get("RUNTIME_SCHEMA_TEST_DATABASE_URL", "")
 
 
@@ -154,6 +208,36 @@ class RuntimeSchemaAcceptance(unittest.TestCase):
         finally:
             with closing(connect(URL)) as db:
                 db.execute("DELETE FROM __APP_SCHEMA__.schema_migrations WHERE version=9999")
+
+    def test_identity_creation_works_without_sequence_grants(self):
+        from psycopg import sql
+        from admin_service import create_service, save_resource
+        from pg_store import SalonScope
+        with closing(connect(URL)) as db:
+            sequences = [row[0] for row in db.execute("""SELECT c.relname FROM pg_class c
+                JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname=? AND c.relkind='S'""", (db.schema_name,))]
+            for name in sequences:
+                db.connection.execute(sql.SQL("REVOKE ALL ON SEQUENCE {}.{} FROM CURRENT_USER")
+                                      .format(sql.Identifier(db.schema_name), sql.Identifier(name)))
+        try:
+            with closing(connect(URL)) as db:
+                self.assertFalse(db.execute("""SELECT EXISTS(SELECT 1 FROM pg_class c
+                    JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=?
+                    AND c.relkind='S' AND has_sequence_privilege(current_user,c.oid,'USAGE,UPDATE'))""",
+                    (db.schema_name,)).fetchone()[0])
+            self.assertEqual(startup.prepare_database(URL, mode="verify"), self.admin)
+            scope = SalonScope(URL, 1)
+            service = create_service(scope, "Synthetic identity service", 30, "synthetic-test")
+            master = save_resource(scope, "master", None, "Synthetic identity master",
+                                   [service["id"]], True, "synthetic-test")
+            self.assertGreater(service["id"], 0)
+            self.assertGreater(master["id"], 0)
+        finally:
+            with closing(connect(URL)) as db:
+                for name in sequences:
+                    db.connection.execute(sql.SQL("GRANT ALL ON SEQUENCE {}.{} TO CURRENT_USER")
+                                          .format(sql.Identifier(db.schema_name), sql.Identifier(name)))
 
 
 if __name__ == "__main__":

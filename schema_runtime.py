@@ -13,11 +13,56 @@ import json
 import ast
 from pathlib import Path
 import re
+from database_namespace import quote_identifier
 
 ROOT = Path(__file__).resolve().parent
 CONTRACT = ROOT / "schema_contract.json"
 SOURCES = ("schema_postgres.sql", "shared_schema.sql", "shared_schema.py",
            "booking_core.py:migrate", "vk_connections.py:upgrade_vk")
+
+# Actual runtime SQL, including SECURITY INVOKER projection triggers. Migration
+# history is read-only. Bootstrap templates and the global busy registry are
+# accessed by SECURITY DEFINER functions, never directly by the runtime role.
+READ = ("SELECT",)
+APPEND = ("SELECT", "INSERT")  # INSERT ... RETURNING id needs SELECT too.
+WRITE = ("SELECT", "INSERT", "UPDATE")
+CRUD = ("SELECT", "INSERT", "UPDATE", "DELETE")
+RUNTIME_TABLE_PRIVILEGES = {
+    "schema_migrations": READ,
+    "services": WRITE, "masters": WRITE, "rooms": WRITE,
+    "master_services": ("SELECT", "INSERT", "DELETE"),
+    "room_services": ("SELECT", "INSERT", "DELETE"),
+    "work_intervals": ("SELECT", "INSERT", "DELETE"),
+    "resource_blocks": APPEND, "clients": WRITE, "bookings": WRITE,
+    "booking_history": APPEND, "vk_dialogs": CRUD, "inbound_events": WRITE,
+    "action_results": APPEND, "message_outbox": WRITE,
+    "vk_outgoing_messages": WRITE, "admin_users": WRITE,
+    # Account creation uses the owner-security admin_users view. Direct accounts
+    # SELECT/FOR UPDATE calls need SELECT/UPDATE, not INSERT on the base table.
+    "accounts": ("SELECT", "UPDATE"),
+    "admin_sessions": CRUD, "admin_audit_log": APPEND,
+    "account_audit_log": APPEND, "salons": WRITE, "salon_memberships": WRITE,
+    "shared_masters": APPEND, "entity_types": CRUD, "entities": CRUD,
+    "entity_parameters": CRUD, "entity_parameter_values": CRUD,
+    "salon_creation_requests": APPEND, "vk_connections": WRITE,
+}
+RUNTIME_FUNCTIONS = ("current_salon_id()", "shared_master_conflict(bigint,text,text,bigint)")
+
+# Effective authority matters even though owner names are deliberately excluded
+# from structural fingerprints. Include nested INVOKER triggers/row locks.
+DEFINER_TABLE_PRIVILEGES = {
+    "check_required_entity_values": {
+        "entities": READ, "entity_parameters": READ, "entity_parameter_values": READ},
+    "initialize_salon_metadata": {
+        "core_entity_templates": READ, "entity_types": WRITE,
+        "entity_parameters": WRITE, "entities": WRITE,
+        "entity_parameter_values": APPEND, "salons": ("SELECT", "UPDATE")},
+    "shared_master_conflict": {
+        "masters": READ, "bookings": READ, "shared_master_busy": READ},
+    "protect_booking_overlap": {
+        "masters": READ, "bookings": READ, "shared_master_busy": READ},
+    "sync_shared_master_busy": {"masters": READ, "shared_master_busy": CRUD},
+}
 
 # These SELECTs intentionally use only catalog columns present in PostgreSQL 16.
 # PG18 stores table NOT NULL constraints in pg_constraint too; attnotnull is
@@ -156,6 +201,109 @@ def schema_version(db):
     return db.execute("SELECT max(version) FROM __APP_SCHEMA__.schema_migrations").fetchone()[0] if exists else 0
 
 
+def runtime_privilege_issues(db):
+    """Inspect required operations only; return static names, never row data."""
+    issues = []
+    if not db.execute("SELECT has_database_privilege(current_user,current_database(),'TEMP')").fetchone()[0]:
+        issues.append("database TEMPORARY")
+    required = [{"relation": table, "privilege": privilege}
+                for table, privileges in sorted(RUNTIME_TABLE_PRIVILEGES.items())
+                for privilege in privileges]
+    missing = db.execute("""SELECT r.relation,r.privilege FROM jsonb_to_recordset(?::jsonb)
+        AS r(relation text,privilege text)
+        LEFT JOIN pg_namespace n ON n.nspname=?
+        LEFT JOIN pg_class c ON c.relnamespace=n.oid AND c.relname=r.relation
+        AND c.relkind IN ('r','v','p')
+        WHERE c.oid IS NULL OR NOT has_table_privilege(current_user,c.oid,r.privilege)
+        ORDER BY r.relation,r.privilege""", (json.dumps(required), db.schema_name))
+    for row in missing:
+        # Only known requirements can reach the log, even on catalog drift.
+        if row["privilege"] in RUNTIME_TABLE_PRIVILEGES.get(row["relation"], ()):
+            issues.append(f'{row["relation"]} {row["privilege"]}')
+    # Identity defaults allocate internally without a sequence ACL check.
+    # Only serial/default nextval callers need USAGE or UPDATE; runtime inserts
+    # retrieve IDs through RETURNING, never currval/lastval.
+    insert_tables = [table for table, privileges in RUNTIME_TABLE_PRIVILEGES.items()
+                     if "INSERT" in privileges]
+    sequences = db.execute("""SELECT DISTINCT t.relname AS relation FROM pg_class s
+        JOIN pg_namespace n ON n.oid=s.relnamespace
+        JOIN pg_depend d ON d.classid='pg_class'::regclass AND d.objid=s.oid
+        AND d.refclassid='pg_class'::regclass AND d.deptype IN ('a','i')
+        JOIN pg_class t ON t.oid=d.refobjid AND t.relnamespace=n.oid
+        JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=d.refobjsubid
+        WHERE n.nspname=? AND s.relkind='S' AND t.relname=ANY(?::text[])
+        AND a.attidentity=''
+        AND NOT has_sequence_privilege(current_user,s.oid,'USAGE,UPDATE')
+        ORDER BY t.relname""", (db.schema_name, insert_tables))
+    for row in sequences:
+        if row["relation"] in insert_tables:
+            issues.append(f'{row["relation"]} sequence USAGE or UPDATE')
+    for signature in RUNTIME_FUNCTIONS:
+        qualified = quote_identifier(db.schema_name) + "." + signature
+        allowed = db.execute("""SELECT COALESCE(has_function_privilege(
+            current_user,to_regprocedure(?),'EXECUTE'),false)""", (qualified,)).fetchone()[0]
+        if not allowed:
+            issues.append(f"{signature} EXECUTE")
+    return issues
+
+
+def owner_privilege_issues(db):
+    """Check existing definer/view authority without granting runtime access."""
+    issues = []
+    required = [{"function": function, "relation": table, "privilege": privilege}
+                for function, tables in DEFINER_TABLE_PRIVILEGES.items()
+                for table, privileges in tables.items() for privilege in privileges]
+    missing = db.execute("""SELECT DISTINCT r.function,r.relation,r.privilege
+        FROM jsonb_to_recordset(?::jsonb) AS r(function text,relation text,privilege text)
+        LEFT JOIN pg_namespace n ON n.nspname=?
+        LEFT JOIN pg_proc p ON p.pronamespace=n.oid AND p.proname=r.function
+        AND p.prokind='f' AND p.prosecdef
+        LEFT JOIN pg_class c ON c.relnamespace=n.oid AND c.relname=r.relation
+        AND c.relkind IN ('r','p')
+        WHERE p.oid IS NULL OR c.oid IS NULL
+        OR NOT has_table_privilege(p.proowner,c.oid,r.privilege)
+        ORDER BY r.function,r.relation,r.privilege""", (json.dumps(required), db.schema_name))
+    for row in missing:
+        if row["privilege"] in DEFINER_TABLE_PRIVILEGES.get(row["function"], {}).get(row["relation"], ()):
+            issues.append(f'{row["function"]} owner {row["relation"]} {row["privilege"]}')
+    owners = db.execute("""SELECT DISTINCT p.proname AS function,
+        has_schema_privilege(p.proowner,n.oid,'USAGE') AS schema_usage,
+        (p.proname IN ('shared_master_conflict','protect_booking_overlap')
+          OR NOT (r.rolsuper OR r.rolbypassrls)) AS needs_scope_function,
+        COALESCE(has_function_privilege(p.proowner,to_regprocedure(?),'EXECUTE'),false) AS scope_execute
+        FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        JOIN pg_roles r ON r.oid=p.proowner
+        WHERE n.nspname=? AND p.proname=ANY(?::text[])
+        AND p.prokind='f' AND p.prosecdef ORDER BY p.proname""",
+        (quote_identifier(db.schema_name) + ".current_salon_id()", db.schema_name,
+         list(DEFINER_TABLE_PRIVILEGES)))
+    for row in owners:
+        if row["function"] not in DEFINER_TABLE_PRIVILEGES:
+            continue
+        if not row["schema_usage"]:
+            issues.append(f'{row["function"]} owner schema USAGE')
+        if row["needs_scope_function"] and not row["scope_execute"]:
+            issues.append(f'{row["function"]} owner current_salon_id() EXECUTE')
+    missing_view = db.execute("""SELECT privilege FROM pg_class v
+        JOIN pg_namespace n ON n.oid=v.relnamespace
+        JOIN pg_class t ON t.relnamespace=n.oid AND t.relname='accounts'
+        CROSS JOIN (VALUES ('SELECT'),('INSERT'),('UPDATE')) required(privilege)
+        WHERE n.nspname=? AND v.relname='admin_users' AND v.relkind='v'
+        AND NOT has_table_privilege(v.relowner,t.oid,privilege)
+        ORDER BY privilege""", (db.schema_name,))
+    for row in missing_view:
+        if row["privilege"] in WRITE:
+            issues.append(f'admin_users view owner accounts {row["privilege"]}')
+    invoker_view = db.execute("""SELECT 1 FROM pg_class v
+        JOIN pg_namespace n ON n.oid=v.relnamespace
+        WHERE n.nspname=? AND v.relname='admin_users' AND v.relkind='v'
+        AND COALESCE((SELECT option_value::boolean FROM pg_options_to_table(v.reloptions)
+                      WHERE option_name='security_invoker'),false)""", (db.schema_name,)).fetchone()
+    if invoker_view:
+        issues.append("admin_users view requires owner security (security_invoker=false)")
+    return issues
+
+
 def verify_runtime_schema(db):
     """Check one stable catalog snapshot, with no DDL and no application writes."""
     expected = json.loads(CONTRACT.read_text(encoding="utf-8"))
@@ -168,27 +316,7 @@ def verify_runtime_schema(db):
         role = db.execute("SELECT rolsuper,rolbypassrls FROM pg_roles WHERE rolname=current_user").fetchone()
         if not role or role["rolsuper"] or role["rolbypassrls"]:
             raise RuntimeError("Runtime database role must be NOSUPERUSER NOBYPASSRLS")
-        if not db.execute("SELECT has_database_privilege(current_user,current_database(),'TEMP')").fetchone()[0]:
-            raise RuntimeError("Runtime database role needs TEMPORARY for salon-scoped views")
-        missing = db.execute("""SELECT 1 FROM pg_class c
-            JOIN pg_namespace n ON n.oid=c.relnamespace
-            WHERE n.nspname=? AND (
-              (c.relkind IN ('r','v') AND (
-                NOT has_table_privilege(current_user,c.oid,'SELECT') OR
-                NOT has_table_privilege(current_user,c.oid,'INSERT') OR
-                NOT has_table_privilege(current_user,c.oid,'UPDATE') OR
-                NOT has_table_privilege(current_user,c.oid,'DELETE'))) OR
-              (c.relkind='S' AND NOT has_sequence_privilege(current_user,c.oid,'USAGE')))
-            LIMIT 1""", (db.schema_name,)).fetchone()
-        if missing:
-            raise RuntimeError("Runtime database role needs table DML and sequence USAGE in the application schema")
-        missing_function = db.execute("""SELECT 1 FROM pg_proc p
-            JOIN pg_namespace n ON n.oid=p.pronamespace
-            WHERE n.nspname=? AND p.prokind='f'
-            AND NOT has_function_privilege(current_user,p.oid,'EXECUTE') LIMIT 1""",
-            (db.schema_name,)).fetchone()
-        if missing_function:
-            raise RuntimeError("Runtime database role needs EXECUTE on application functions")
+        privilege_issues = runtime_privilege_issues(db) + owner_privilege_issues(db)
         actual = catalog_fingerprints(db)
         unenforced_not_null = db.execute("""SELECT 1 FROM pg_constraint k
             JOIN pg_class c ON c.oid=k.conrelid
@@ -196,14 +324,22 @@ def verify_runtime_schema(db):
             WHERE n.nspname=? AND k.contype='n'
             AND COALESCE((to_jsonb(k)->>'conenforced')::boolean,true)=false LIMIT 1""",
             (db.schema_name,)).fetchone()
-        if unenforced_not_null:
-            raise RuntimeError("Database schema contract mismatch: NOT NULL enforcement")
         if set(expected["catalog"]) != set(QUERIES):
             raise RuntimeError("Release schema contract is incomplete")
-        for section, digest in expected["catalog"].items():
-            if actual[section] != digest:
-                # Do not print function bodies, role identifiers or database URLs.
-                raise RuntimeError(f"Database schema contract mismatch: {section}; run initialize.py with the migration role")
+        mismatches = [section for section, digest in expected["catalog"].items()
+                      if actual[section] != digest]
+        if unenforced_not_null:
+            mismatches.append("NOT NULL enforcement")
+        errors = []
+        if privilege_issues:
+            errors.append("Database access check failed: " + "; ".join(privilege_issues))
+        if mismatches:
+            errors.append("Database schema contract mismatch: " + ", ".join(mismatches)
+                          + "; run initialize.py with the migration role")
+        if errors:
+            # One failure reports every observed category; no function bodies,
+            # database URLs, credentials or application rows are included.
+            raise RuntimeError(" | ".join(errors))
         db.commit()
     except Exception:
         db.rollback()
