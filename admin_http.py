@@ -33,6 +33,7 @@ from constructor_store import (
     constructor_snapshot, create_type, update_type, delete_type, save_parameter,
     delete_parameter, save_entity, archive_entity, get_policy,
 )
+from solo_setup import get_setup, save_setup, save_schedule
 from vk_connections import VKSetupError
 
 UTC = timezone.utc
@@ -194,6 +195,8 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and path.path == "/api/snapshot":
                 day = date.fromisoformat(parse_qs(path.query).get("date", [date.today().isoformat()])[0])
                 return self._json(200, snapshot(scoped, policy, day))
+            if method == "GET" and path.path == "/api/solo-setup":
+                return self._json(200, get_setup(scoped))
 
             body = self._body() if method == "POST" else {}
             if not isinstance(body, dict):
@@ -215,6 +218,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("acknowledge must be boolean")
             now = self.server.clock()
             actor = identity.actor
+            if method == "POST" and path.path == "/api/solo-setup":
+                return self._json(200, save_setup(scoped, policy, body, actor, now))
+            if method == "POST" and path.path == "/api/solo-schedule":
+                return self._json(200, save_schedule(scoped, policy, body["days"], actor, now, expectations=body))
             if method == "POST" and path.path == "/api/availability-preview":
                 return self._json(200, availability_preview(
                     scoped, policy, body["service_id"], body["master_id"], body["date"], now,

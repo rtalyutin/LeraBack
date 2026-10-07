@@ -127,6 +127,7 @@ def shared_masters(scope, user_id):
 
 
 def attach_master(scope, user_id, source_salon_id, master_id, service_ids, active=True, name=None):
+    from solo_setup import guard_resource
     if type(source_salon_id) is not int or type(master_id) is not int or source_salon_id <= 0 or master_id <= 0:
         raise ValueError("Invalid source master")
     if source_salon_id == scope.salon_id or type(active) is not bool:
@@ -151,6 +152,7 @@ def attach_master(scope, user_id, source_salon_id, master_id, service_ids, activ
                 (user_id, scope.salon_id, source_salon_id)))
             if {r[0] for r in memberships} != {scope.salon_id, source_salon_id}:
                 raise AuthorizationError("Salon access denied")
+            guard_resource(db, "master", None, active, service_ids)
             _unique_name(db, "masters", name)
             for service_id in set(service_ids):
                 if not db.execute("SELECT 1 FROM services WHERE id=?", (service_id,)).fetchone():

@@ -81,6 +81,7 @@ def _iso_day_bounds(local_day: date, zone):
 
 
 def snapshot(path, policy, local_day: date):
+    from solo_setup import setup_snapshot
     zone = validate_policy(policy)
     lower, upper = _iso_day_bounds(local_day, zone)
     with closing(connect(path)) as db:
@@ -93,6 +94,7 @@ def snapshot(path, policy, local_day: date):
                 "SELECT id,master_id,room_id,weekday,start_minute,end_minute FROM work_intervals "
                 "WHERE local_date IS NULL AND mode='open' ORDER BY weekday,id")],
         }
+        catalog["solo_setup"] = setup_snapshot(db)
         for table in ("services", "masters", "rooms"):
             for item in catalog[table]:
                 extra = db.execute(f"SELECT entity_id FROM __APP_SCHEMA__.{table} WHERE salon_id=__APP_SCHEMA__.current_salon_id() AND id=?", (item["id"],)).fetchone()
@@ -230,6 +232,7 @@ def _unique_name(db, table, name, object_id=None):
 
 
 def create_service(path, name, duration_minutes, actor, now=None):
+    from solo_setup import associate_service
     now = now or datetime.now(UTC)
     name = _catalog_name(name)
     if type(duration_minutes) is not int or not 1 <= duration_minutes <= 1440:
@@ -240,6 +243,7 @@ def create_service(path, name, duration_minutes, actor, now=None):
             _unique_name(db, "services", name)
             service_id = db.execute("INSERT INTO services(name,duration_minutes) VALUES (?,?)",
                                     (name, duration_minutes)).lastrowid
+            associate_service(db, service_id)
             _admin_audit(db, actor, "service_created", "service", service_id,
                          {"name": name, "duration_minutes": duration_minutes}, now)
             db.commit()
@@ -252,6 +256,7 @@ def create_service(path, name, duration_minutes, actor, now=None):
 def save_resource(path, resource_kind, resource_id, name, service_ids, active, actor,
                   acknowledge=False, now=None):
     """Create/edit a master or room, including its service eligibility."""
+    from solo_setup import guard_resource
     now = now or datetime.now(UTC)
     name = _catalog_name(name)
     if resource_kind not in {"master", "room"} or type(active) is not bool:
@@ -265,6 +270,7 @@ def save_resource(path, resource_kind, resource_id, name, service_ids, active, a
     with closing(connect(path)) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
+            guard_resource(db, resource_kind, resource_id, active, service_ids)
             _unique_name(db, table, name, resource_id)
             for service_id in service_ids:
                 if not db.execute("SELECT 1 FROM services WHERE id=?", (service_id,)).fetchone():
@@ -306,6 +312,7 @@ def save_resource(path, resource_kind, resource_id, name, service_ids, active, a
 
 
 def update_service(path, service_id, name, duration_minutes, active, actor, acknowledge=False, now=None):
+    from solo_setup import associate_service
     now = now or datetime.now(UTC)
     name = _catalog_name(name)
     if type(duration_minutes) is not int or not 1 <= duration_minutes <= 1440 or type(active) is not bool:
@@ -326,6 +333,8 @@ def update_service(path, service_id, name, duration_minutes, active, actor, ackn
                 raise AdminConflict("Service change affects future confirmed bookings", affected)
             db.execute("UPDATE services SET name=?,duration_minutes=?,active=? WHERE id=?",
                        (name, duration_minutes, int(bool(active)), service_id))
+            if active:
+                associate_service(db, service_id)
             manual_contact = _cancel_affected(db, affected, actor, "service_changed", now) if changed_availability else []
             _admin_audit(db, actor, "service_updated", "service", service_id,
                          {"duration_minutes": duration_minutes, "active": bool(active),
@@ -345,6 +354,7 @@ def update_weekly_schedule(path, policy, resource_kind, resource_id, weekday,
 
     The legacy start_minute/end_minute request remains supported.
     """
+    from solo_setup import guard_individual_schedule
     now = now or datetime.now(UTC)
     zone = validate_policy(policy)
     if resource_kind not in {"master", "room"} or type(weekday) is not int or not 0 <= weekday <= 6:
@@ -376,6 +386,7 @@ def update_weekly_schedule(path, policy, resource_kind, resource_id, weekday,
     with closing(connect(path)) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
+            guard_individual_schedule(db)
             if not db.execute(f"SELECT 1 FROM {table} WHERE id=?", (resource_id,)).fetchone():
                 raise LookupError("Resource not found")
             db.execute(f"DELETE FROM work_intervals WHERE {column}=? AND weekday=? AND local_date IS NULL AND mode='open'",
@@ -475,6 +486,7 @@ def update_weekly_schedule_batch(path, policy, resource_kind, resource_id, days,
     Unlike the legacy single-day endpoint, this command never cancels bookings.
     An impact conflict is always returned before any schedule writes.
     """
+    from solo_setup import guard_individual_schedule
     now = now or datetime.now(UTC)
     zone = validate_policy(policy)
     if not actor or now.tzinfo is None:
@@ -486,6 +498,7 @@ def update_weekly_schedule_batch(path, policy, resource_kind, resource_id, days,
     with closing(connect(path)) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
+            guard_individual_schedule(db)
             _require_resource(db, resource_kind, resource_id)
             upcoming = db.execute(
                 f"SELECT id,start_utc,end_utc FROM bookings WHERE {column}=? "

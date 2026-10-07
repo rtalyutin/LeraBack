@@ -173,6 +173,8 @@ def save_parameter(db, payload, actor=None):
         if (dtype == "reference") != (ref_id is not None):
             raise ConstructorError("A reference parameter needs reference_type_id")
         typ = _row(db, "entity_types", sid, type_id)
+        if typ["code"] == "salon_settings" and code == "constructor_mode":
+            raise ConstructorError("Constructor mode is managed through the solo setup API")
         if typ["core"] and required and not (old and old["core"]):
             raise ConstructorError("Additional core parameters must be optional")
         if ref_id is not None:
@@ -197,6 +199,9 @@ def save_parameter(db, payload, actor=None):
 def delete_parameter(db, parameter_id, actor=None):
     with _mutation(db) as sid:
         old = _row(db, "entity_parameters", sid, parameter_id)
+        typ = _row(db, "entity_types", sid, old["entity_type_id"])
+        if typ["code"] == "salon_settings" and old["code"] == "constructor_mode":
+            raise ConstructorError("Constructor mode is managed through the solo setup API")
         if old["core"]:
             raise ConstructorError("Core parameters cannot be deleted")
         if db.execute("SELECT 1 FROM __APP_SCHEMA__.entity_parameter_values WHERE salon_id=? AND parameter_id=? LIMIT 1", (sid, parameter_id)).fetchone():
@@ -258,6 +263,8 @@ def save_entity(db, payload, actor=None):
             if old["entity_type_id"] != type_id or old["archived"]:
                 raise ConstructorError("Entity has another type or is archived")
         parameters = {p["code"]: p for p in db.execute("SELECT * FROM __APP_SCHEMA__.entity_parameters WHERE salon_id=? AND entity_type_id=?", (sid, type_id))}
+        if typ["code"] == "salon_settings" and "constructor_mode" in values:
+            raise ConstructorError("Constructor mode is managed through the solo setup API")
         for code, value in values.items():
             if code not in parameters:
                 raise ConstructorError(f"Unknown parameter: {code}")

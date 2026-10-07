@@ -173,6 +173,9 @@ class CallbackGateway:
             if not masters:
                 self._save(vk_id, "home", {})
                 return "Для этой услуги пока нет доступных мастеров. Попробуйте позже.", [button("В меню", "home")], None
+            if len(masters) == 1:
+                draft.update(master_id=masters[0]["id"], master_name=masters[0]["name"])
+                return self._show_days(vk_id, draft, now)
             choices = [dict(button(r["name"], "master", r["id"], draft["id"]),
                             avatar_master_id=r["id"]) for r in masters]
             return "Выберите мастера", choices, None

@@ -8,3 +8,4 @@ CREATE DATABASE shared_schema_test OWNER lera_test;
 CREATE DATABASE multisalon_test OWNER lera_test;
 CREATE DATABASE namespace_test OWNER lera_test;
 CREATE DATABASE vk_connections_test OWNER lera_test;
+CREATE DATABASE solo_test OWNER lera_test;
